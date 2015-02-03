@@ -41,10 +41,21 @@ default_settings = {
 		"host": "0.0.0.0",
 		"port": 5000,
 		"firstRun": True,
-	    "secretKey": None,
-		"baseUrl": "",
-		"scheme": "",
-		"forwardedHost": ""
+		"secretKey": None,
+		"reverseProxy": {
+			"prefixHeader": "X-Script-Name",
+			"schemeHeader": "X-Scheme",
+			"hostHeader": "X-Forwarded-Host",
+			"prefixFallback": "",
+			"schemeFallback": "",
+			"hostFallback": ""
+		},
+		"uploads": {
+			"maxSize":  1 * 1024 * 1024 * 1024, # 1GB
+			"nameSuffix": "name",
+			"pathSuffix": "path"
+		},
+		"maxSize": 100 * 1024, # 100 KB
 	},
 	"webcam": {
 		"stream": None,
@@ -65,6 +76,9 @@ default_settings = {
 		"mobileSizeThreshold": 2 * 1024 * 1024, # 2MB
 		"sizeThreshold": 20 * 1024 * 1024, # 20MB
 	},
+	"gcodeAnalysis": {
+		"maxExtruders": 10
+	},
 	"feature": {
 		"temperatureGraph": True,
 		"waitForStartOnConnect": False,
@@ -72,38 +86,33 @@ default_settings = {
 		"sdSupport": True,
 		"sdAlwaysAvailable": False,
 		"swallowOkAfterResend": True,
-		"repetierTargetTemp": False
+		"repetierTargetTemp": False,
+		"keyboardControl": True
 	},
 	"folder": {
 		"uploads": None,
 		"timelapse": None,
 		"timelapse_tmp": None,
 		"logs": None,
-		"virtualSd": None
+		"virtualSd": None,
+		"watched": None,
+		"plugins": None,
+		"slicingProfiles": None,
+		"printerProfiles": None
 	},
 	"temperature": {
-		"profiles":
-			[
-				{"name": "ABS", "extruder" : 210, "bed" : 100 },
-				{"name": "PLA", "extruder" : 180, "bed" : 60 }
-			]
+		"profiles": [
+			{"name": "ABS", "extruder" : 210, "bed" : 100 },
+			{"name": "PLA", "extruder" : 180, "bed" : 60 }
+		]
+	},
+	"printerProfiles": {
+		"default": None,
+		"defaultProfile": {}
 	},
 	"printerParameters": {
-		"movementSpeed": {
-			"x": 6000,
-			"y": 6000,
-			"z": 200,
-			"e": 300
-		},
 		"pauseTriggers": [],
-		"invertAxes": [],
-		"numExtruders": 1,
-		"extruderOffsets": [
-			{"x": 0.0, "y": 0.0}
-		],
-		"bedDimensions": {
-			"x": 200.0, "y": 200.0
-		}
+		"defaultExtrusionLength": 5
 	},
 	"appearance": {
 		"name": "",
@@ -122,10 +131,10 @@ default_settings = {
 		"localNetworks": ["127.0.0.0/8"],
 		"autologinAs": None
 	},
-	"cura": {
-		"enabled": False,
-		"path": "/default/path/to/cura",
-		"config": "/default/path/to/your/cura/config.ini"
+	"slicing": {
+		"enabled": True,
+		"defaultSlicer": "cura",
+		"defaultProfiles": None
 	},
 	"events": {
 		"enabled": True,
@@ -133,12 +142,15 @@ default_settings = {
 	},
 	"api": {
 		"enabled": True,
-		"key": None
+		"key": None,
+		"allowCrossOrigin": False,
+		"apps": {}
 	},
 	"terminalFilters": [
 		{ "name": "Suppress M105 requests/responses", "regex": "(Send: M105)|(Recv: ok T\d*:)" },
 		{ "name": "Suppress M27 requests/responses", "regex": "(Send: M27)|(Recv: SD printing byte)" }
 	],
+	"plugins": {},
 	"devel": {
 		"stylesheet": "css",
 		"virtualPrinter": {
@@ -148,8 +160,21 @@ default_settings = {
 			"okWithLinenumber": False,
 			"numExtruders": 1,
 			"includeCurrentToolInTemps": True,
+			"movementSpeed": {
+				"x": 6000,
+				"y": 6000,
+				"z": 200,
+				"e": 300
+			},
 			"hasBed": True,
-			"repetierStyleTargetTemperature": False
+			"repetierStyleTargetTemperature": False,
+			"smoothieTemperatureReporting": False,
+			"extendedSdFileList": False,
+			"throttle": 0.01,
+			"waitOnLongMoves": False,
+			"rxBuffer": 64,
+			"txBuffer": 40,
+			"commandBuffer": 4
 		}
 	}
 }
@@ -165,6 +190,7 @@ class Settings(object):
 
 		self._config = None
 		self._dirty = False
+		self._mtime = None
 
 		self._init_settings_dir(basedir)
 
@@ -199,7 +225,8 @@ class Settings(object):
 		if os.path.exists(self._configfile) and os.path.isfile(self._configfile):
 			with open(self._configfile, "r") as f:
 				self._config = yaml.safe_load(f)
-		# chamged from else to handle cases where the file exists, but is empty / 0 bytes
+				self._mtime = self._last_modified()
+		# changed from else to handle cases where the file exists, but is empty / 0 bytes
 		if not self._config:
 			self._config = {}
 
@@ -207,9 +234,96 @@ class Settings(object):
 			self._migrateConfig()
 
 	def _migrateConfig(self):
-		if not self._config:
-			return
+		dirty = False
+		for migrate in (self._migrate_event_config, self._migrate_reverse_proxy_config, self._migrate_printer_parameters):
+			dirty = migrate() or dirty
+		if dirty:
+			self.save(force=True)
 
+	def _migrate_printer_parameters(self):
+		default_profile = self._config["printerProfiles"]["defaultProfile"] if "printerProfiles" in self._config and "defaultProfile" in self._config["printerProfiles"] else dict()
+		dirty = False
+
+		if "printerParameters" in self._config:
+			printer_parameters = self._config["printerParameters"]
+
+			if "movementSpeed" in printer_parameters or "invertAxes" in printer_parameters:
+				default_profile["axes"] = dict(x=dict(), y=dict(), z=dict(), e=dict())
+				if "movementSpeed" in printer_parameters:
+					for axis in ("x", "y", "z", "e"):
+						if axis in printer_parameters["movementSpeed"]:
+							default_profile["axes"][axis]["speed"] = printer_parameters["movementSpeed"][axis]
+					del self._config["printerParameters"]["movementSpeed"]
+				if "invertedAxes" in printer_parameters:
+					for axis in ("x", "y", "z", "e"):
+						if axis in printer_parameters["invertedAxes"]:
+							default_profile["axes"][axis]["inverted"] = True
+					del self._config["printerParameters"]["invertedAxes"]
+
+			if "numExtruders" in printer_parameters or "extruderOffsets" in printer_parameters:
+				if not "extruder" in default_profile:
+					default_profile["extruder"] = dict()
+
+				if "numExtruders" in printer_parameters:
+					default_profile["extruder"]["count"] = printer_parameters["numExtruders"]
+					del self._config["printerParameters"]["numExtruders"]
+				if "extruderOffsets" in printer_parameters:
+					extruder_offsets = []
+					for offset in printer_parameters["extruderOffsets"]:
+						if "x" in offset and "y" in offset:
+							extruder_offsets.append((offset["x"], offset["y"]))
+					default_profile["extruder"]["offsets"] = extruder_offsets
+					del self._config["printerParameters"]["extruderOffsets"]
+
+			if "bedDimensions" in printer_parameters:
+				bed_dimensions = printer_parameters["bedDimensions"]
+				if not "volume" in default_profile:
+					default_profile["volume"] = dict()
+
+				if "circular" in bed_dimensions and "r" in bed_dimensions and bed_dimensions["circular"]:
+					default_profile["volume"]["formFactor"] = "circular"
+					default_profile["volume"]["width"] = 2 * bed_dimensions["r"]
+					default_profile["volume"]["depth"] = default_profile["volume"]["width"]
+				elif "x" in bed_dimensions or "y" in bed_dimensions:
+					default_profile["volume"]["formFactor"] = "rectangular"
+					if "x" in bed_dimensions:
+						default_profile["volume"]["width"] = bed_dimensions["x"]
+					if "y" in bed_dimensions:
+						default_profile["volume"]["depth"] = bed_dimensions["y"]
+				del self._config["printerParameters"]["bedDimensions"]
+
+			dirty = True
+
+		if dirty:
+			if not "printerProfiles" in self._config:
+				self._config["printerProfiles"] = dict()
+			self._config["printerProfiles"]["defaultProfile"] = default_profile
+		return dirty
+
+	def _migrate_reverse_proxy_config(self):
+		if "server" in self._config.keys() and ("baseUrl" in self._config["server"] or "scheme" in self._config["server"]):
+			prefix = ""
+			if "baseUrl" in self._config["server"]:
+				prefix = self._config["server"]["baseUrl"]
+				del self._config["server"]["baseUrl"]
+
+			scheme = ""
+			if "scheme" in self._config["server"]:
+				scheme = self._config["server"]["scheme"]
+				del self._config["server"]["scheme"]
+
+			if not "reverseProxy" in self._config["server"] or not isinstance(self._config["server"]["reverseProxy"], dict):
+				self._config["server"]["reverseProxy"] = dict()
+			if prefix:
+				self._config["server"]["reverseProxy"]["prefixFallback"] = prefix
+			if scheme:
+				self._config["server"]["reverseProxy"]["schemeFallback"] = scheme
+			self._logger.info("Migrated reverse proxy configuration to new structure")
+			return True
+		else:
+			return False
+
+	def _migrate_event_config(self):
 		if "events" in self._config.keys() and ("gcodeCommandTrigger" in self._config["events"] or "systemCommandTrigger" in self._config["events"]):
 			self._logger.info("Migrating config (event subscriptions)...")
 
@@ -291,26 +405,36 @@ class Settings(object):
 					newEvents["subscriptions"].append(newTrigger)
 
 			self._config["events"] = newEvents
-			self.save(force=True)
 			self._logger.info("Migrated %d event subscriptions to new format and structure" % len(newEvents["subscriptions"]))
+			return True
+		else:
+			return False
 
 	def save(self, force=False):
 		if not self._dirty and not force:
-			return
+			return False
 
 		with open(self._configfile, "wb") as configFile:
 			yaml.safe_dump(self._config, configFile, default_flow_style=False, indent="    ", allow_unicode=True)
 			self._dirty = False
 		self.load()
+		return True
+
+	def _last_modified(self):
+		stat = os.stat(self._configfile)
+		return stat.st_mtime
 
 	#~~ getter
 
-	def get(self, path, asdict=False):
+	def get(self, path, asdict=False, defaults=None, merged=False):
+		import octoprint.util as util
+
 		if len(path) == 0:
 			return None
 
 		config = self._config
-		defaults = default_settings
+		if defaults is None:
+			defaults = default_settings
 
 		while len(path) > 1:
 			key = path.pop(0)
@@ -336,6 +460,8 @@ class Settings(object):
 		for key in keys:
 			if key in config.keys():
 				value = config[key]
+				if merged and key in defaults:
+					value = util.dict_merge(defaults[key], value)
 			elif key in defaults:
 				value = defaults[key]
 			else:
@@ -354,8 +480,8 @@ class Settings(object):
 		else:
 			return results
 
-	def getInt(self, path):
-		value = self.get(path)
+	def getInt(self, path, defaults=None):
+		value = self.get(path, defaults=defaults)
 		if value is None:
 			return None
 
@@ -365,8 +491,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getFloat(self, path):
-		value = self.get(path)
+	def getFloat(self, path, defaults=None):
+		value = self.get(path, defaults=defaults)
 		if value is None:
 			return None
 
@@ -376,13 +502,17 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getBoolean(self, path):
-		value = self.get(path)
+	def getBoolean(self, path, defaults=None):
+		value = self.get(path, defaults=defaults)
 		if value is None:
 			return None
 		if isinstance(value, bool):
 			return value
-		return value.lower() in valid_boolean_trues
+		if isinstance(value, (int, float)):
+			return value != 0
+		if isinstance(value, (str, unicode)):
+			return value.lower() in valid_boolean_trues
+		return value is not None
 
 	def getBaseFolder(self, type):
 		if type not in default_settings["folder"].keys():
@@ -447,12 +577,16 @@ class Settings(object):
 
 	#~~ setter
 
-	def set(self, path, value, force=False):
+	def set(self, path, value, force=False, defaults=None):
 		if len(path) == 0:
 			return
 
+		if self._mtime is not None and self._last_modified() != self._mtime:
+			self.load()
+
 		config = self._config
-		defaults = default_settings
+		if defaults is None:
+			defaults = default_settings
 
 		while len(path) > 1:
 			key = path.pop(0)
@@ -477,9 +611,9 @@ class Settings(object):
 				config[key] = value
 			self._dirty = True
 
-	def setInt(self, path, value, force=False):
+	def setInt(self, path, value, force=False, defaults=None):
 		if value is None:
-			self.set(path, None, force)
+			self.set(path, None, force=force, defaults=defaults)
 			return
 
 		try:
@@ -490,9 +624,9 @@ class Settings(object):
 
 		self.set(path, intValue, force)
 
-	def setFloat(self, path, value, force=False):
+	def setFloat(self, path, value, force=False, defaults=None):
 		if value is None:
-			self.set(path, None, force)
+			self.set(path, None, force=force, defaults=defaults)
 			return
 
 		try:
@@ -503,13 +637,13 @@ class Settings(object):
 
 		self.set(path, floatValue, force)
 
-	def setBoolean(self, path, value, force=False):
+	def setBoolean(self, path, value, force=False, defaults=None):
 		if value is None or isinstance(value, bool):
-			self.set(path, value, force)
+			self.set(path, value, force=force, defaults=defaults)
 		elif value.lower() in valid_boolean_trues:
-			self.set(path, True, force)
+			self.set(path, True, force=force, defaults=defaults)
 		else:
-			self.set(path, False, force)
+			self.set(path, False, force=force, defaults=defaults)
 
 	def setBaseFolder(self, type, path, force=False):
 		if type not in default_settings["folder"].keys():

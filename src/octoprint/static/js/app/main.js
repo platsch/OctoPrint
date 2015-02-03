@@ -1,33 +1,32 @@
 $(function() {
-        //~~ Initialize view models
-        var loginStateViewModel = new LoginStateViewModel();
-        var usersViewModel = new UsersViewModel(loginStateViewModel);
-        var settingsViewModel = new SettingsViewModel(loginStateViewModel, usersViewModel);
-        var connectionViewModel = new ConnectionViewModel(loginStateViewModel, settingsViewModel);
-        var timelapseViewModel = new TimelapseViewModel(loginStateViewModel);
-        var printerStateViewModel = new PrinterStateViewModel(loginStateViewModel, timelapseViewModel);
-        var appearanceViewModel = new AppearanceViewModel(settingsViewModel);
-        var temperatureViewModel = new TemperatureViewModel(loginStateViewModel, settingsViewModel);
-        var controlViewModel = new ControlViewModel(loginStateViewModel, settingsViewModel);
-        var terminalViewModel = new TerminalViewModel(loginStateViewModel, settingsViewModel);
-        var gcodeFilesViewModel = new GcodeFilesViewModel(printerStateViewModel, loginStateViewModel);
-        var gcodeViewModel = new GcodeViewModel(loginStateViewModel, settingsViewModel);
-        var navigationViewModel = new NavigationViewModel(loginStateViewModel, appearanceViewModel, settingsViewModel, usersViewModel);
-        var logViewModel = new LogViewModel(loginStateViewModel);
+        //~~ Initialize i18n
+        var catalog = window["BABEL_TO_LOAD_" + LOCALE];
+        if (catalog === undefined) {
+            catalog = {messages: undefined, plural_expr: undefined, locale: undefined, domain: undefined}
+        }
+        babel.Translations.load(catalog).install();
 
-        var dataUpdater = new DataUpdater(
-            loginStateViewModel,
-            connectionViewModel, 
-            printerStateViewModel, 
-            temperatureViewModel, 
-            controlViewModel,
-            terminalViewModel,
-            gcodeFilesViewModel,
-            timelapseViewModel,
-            gcodeViewModel,
-			logViewModel
-        );
-        
+        moment.locale(LOCALE);
+
+        // Dummy translation requests for dynamic strings supplied by the backend
+        var dummyTranslations = [
+            // printer states
+            gettext("Offline"),
+            gettext("Opening serial port"),
+            gettext("Detecting serial port"),
+            gettext("Detecting baudrate"),
+            gettext("Connecting"),
+            gettext("Operational"),
+            gettext("Printing from SD"),
+            gettext("Sending file to SD"),
+            gettext("Printing"),
+            gettext("Paused"),
+            gettext("Closed"),
+            gettext("Transfering file to SD")
+        ];
+
+        PNotify.prototype.options.styling = "bootstrap2";
+
         // work around a stupid iOS6 bug where ajax requests get cached and only work once, as described at
         // http://stackoverflow.com/questions/12506897/is-safari-on-ios-6-caching-ajax-results
         $.ajaxSetup({
@@ -35,15 +34,97 @@ $(function() {
             headers: { "cache-control": "no-cache" }
         });
 
+        // send the current UI API key with any request
+        $.ajaxSetup({
+            headers: {"X-Api-Key": UI_API_KEY}
+        });
+
         //~~ Show settings - to ensure centered
+        var settingsDialog = $('#settings_dialog');
+        settingsDialog.on('show', function() {
+            _.each(allViewModels, function(viewModel) {
+                if (viewModel.hasOwnProperty("onSettingsShown")) {
+                    viewModel.onSettingsShown();
+                }
+            });
+        });
+        settingsDialog.on('hidden', function() {
+            _.each(allViewModels, function(viewModel) {
+                if (viewModel.hasOwnProperty("onSettingsHidden")) {
+                    viewModel.onSettingsHidden();
+                }
+            });
+        });
         $('#navbar_show_settings').click(function() {
-            $('#settings_dialog').modal()
-                 .css({
-                     width: 'auto',
-                     'margin-left': function() { return -($(this).width() /2); }
-                  });
+            settingsDialog.modal()
+                .css({
+                    width: 'auto',
+                    'margin-left': function() { return -($(this).width() /2); }
+                });
+
             return false;
         });
+
+        //~~ Initialize view models
+        var loginStateViewModel = new LoginStateViewModel();
+        var printerProfilesViewModel = new PrinterProfilesViewModel();
+        var usersViewModel = new UsersViewModel(loginStateViewModel);
+        var timelapseViewModel = new TimelapseViewModel(loginStateViewModel);
+        var printerStateViewModel = new PrinterStateViewModel(loginStateViewModel, timelapseViewModel);
+        var settingsViewModel = new SettingsViewModel(loginStateViewModel, usersViewModel, printerProfilesViewModel);
+        var connectionViewModel = new ConnectionViewModel(loginStateViewModel, settingsViewModel, printerProfilesViewModel);
+        var appearanceViewModel = new AppearanceViewModel(settingsViewModel, printerStateViewModel);
+        var temperatureViewModel = new TemperatureViewModel(loginStateViewModel, settingsViewModel);
+        var controlViewModel = new ControlViewModel(loginStateViewModel, settingsViewModel);
+        var terminalViewModel = new TerminalViewModel(loginStateViewModel, settingsViewModel);
+        var slicingViewModel = new SlicingViewModel(loginStateViewModel, printerProfilesViewModel);
+        var gcodeFilesViewModel = new GcodeFilesViewModel(printerStateViewModel, loginStateViewModel, slicingViewModel);
+        var gcodeViewModel = new GcodeViewModel(loginStateViewModel, settingsViewModel);
+        var navigationViewModel = new NavigationViewModel(loginStateViewModel, appearanceViewModel, settingsViewModel, usersViewModel);
+        var logViewModel = new LogViewModel(loginStateViewModel);
+
+        var viewModelMap = {
+            loginStateViewModel: loginStateViewModel,
+            printerProfilesViewModel: printerProfilesViewModel,
+            usersViewModel: usersViewModel,
+            settingsViewModel: settingsViewModel,
+            connectionViewModel: connectionViewModel,
+            timelapseViewModel: timelapseViewModel,
+            printerStateViewModel: printerStateViewModel,
+            appearanceViewModel: appearanceViewModel,
+            temperatureViewModel: temperatureViewModel,
+            controlViewModel: controlViewModel,
+            terminalViewModel: terminalViewModel,
+            gcodeFilesViewModel: gcodeFilesViewModel,
+            gcodeViewModel: gcodeViewModel,
+            navigationViewModel: navigationViewModel,
+            logViewModel: logViewModel,
+            slicingViewModel: slicingViewModel
+        };
+
+        var allViewModels = _.values(viewModelMap);
+
+        var additionalViewModels = [];
+        _.each(ADDITIONAL_VIEWMODELS, function(viewModel) {
+            var viewModelClass = viewModel[0];
+            var viewModelParameters = viewModel[1];
+            var viewModelBindTarget = viewModel[2];
+
+            var constructorParameters = [];
+            _.each(viewModelParameters, function(parameter) {
+                if (_.has(viewModelMap, parameter)) {
+                    constructorParameters.push(viewModelMap[parameter]);
+                } else {
+                    constructorParameters.push(undefined);
+                }
+            });
+
+            var viewModelInstance = new viewModelClass(constructorParameters);
+            additionalViewModels.push([viewModelInstance, viewModelBindTarget]);
+            allViewModels.push(viewModelInstance);
+        });
+
+        var dataUpdater = new DataUpdater(allViewModels);
 
         //~~ Temperature
 
@@ -52,25 +133,15 @@ $(function() {
             terminalViewModel.updateOutput();
         });
 
-        var webcamDisableTimeout;
-        $('#tabs a[data-toggle="tab"]').on('show', function (e) {
-            var current = e.target;
-            var previous = e.relatedTarget;
+        //~~ File list
 
-            if (current.hash == "#control") {
-                clearTimeout(webcamDisableTimeout);
-                var webcamImage = $("#webcam_image");
-                var currentSrc = webcamImage.attr("src");
-                if (currentSrc === undefined || currentSrc.trim() == "") {
-                    webcamImage.attr("src", CONFIG_WEBCAM_STREAM + "?" + new Date().getTime());
-                }
-            } else if (previous.hash == "#control") {
-                // only disable webcam stream if tab is out of focus for more than 5s, otherwise we might cause
-                // more load by the constant connection creation than by the actual webcam stream
-                webcamDisableTimeout = setTimeout(function() {
-                    $("#webcam_image").attr("src", "");
-                }, 5000);
-            }
+        $(".gcode_files").slimScroll({
+            height: "306px",
+            size: "5px",
+            distance: "0",
+            railVisible: true,
+            alwaysVisible: true,
+            scrollBy: "102px"
         });
 
         //~~ Gcode upload
@@ -87,6 +158,10 @@ $(function() {
             }
             gcodeFilesViewModel.requestData(filename, location);
 
+            if (_.endsWith(filename.toLowerCase(), ".stl")) {
+                slicingViewModel.show(location, filename);
+            }
+
             if (data.result.done) {
                 $("#gcode_upload_progress .bar").css("width", "0%");
                 $("#gcode_upload_progress").removeClass("progress-striped").removeClass("active");
@@ -95,9 +170,11 @@ $(function() {
         }
 
         function gcode_upload_fail(e, data) {
-            $.pnotify({
+            var error = "<p>" + gettext("Could not upload the file. Make sure that it is a GCODE file and has the extension \".gcode\" or \".gco\" or that it is an STL file with the extension \".stl\" and slicing support is enabled and configured.") + "</p>";
+            error += pnotifyAdditionalInfo("<pre>" + data.jqXHR.responseText + "</pre>");
+            new PNotify({
                 title: "Upload failed",
-                text: "<p>Could not upload the file. Make sure that it is a GCODE file and has the extension \".gcode\" or \".gco\" or that it is an STL file with the extension \".stl\" and Cura support is enabled and configured.</p><p>Server reported: <pre>" + data.jqXHR.responseText + "</pre></p>",
+                text: error,
                 type: "error",
                 hide: false
             });
@@ -109,10 +186,10 @@ $(function() {
         function gcode_upload_progress(e, data) {
             var progress = parseInt(data.loaded / data.total * 100, 10);
             $("#gcode_upload_progress .bar").css("width", progress + "%");
-            $("#gcode_upload_progress .bar").text("Uploading ...");
+            $("#gcode_upload_progress .bar").text(gettext("Uploading ..."));
             if (progress >= 100) {
                 $("#gcode_upload_progress").addClass("progress-striped").addClass("active");
-                $("#gcode_upload_progress .bar").text("Saving ...");
+                $("#gcode_upload_progress .bar").text(gettext("Saving ..."));
             }
         }
 
@@ -223,7 +300,7 @@ $(function() {
 
             var foundLocal = false;
             var foundSd = false;
-            var found = false
+            var found = false;
             var node = e.target;
             do {
                 if (dropZoneLocal && node === dropZoneLocal[0]) {
@@ -262,9 +339,6 @@ $(function() {
             }, 100);
         });
 
-        //~~ Offline overlay
-        $("#offline_overlay_reconnect").click(function() {dataUpdater.reconnect()});
-
         //~~ Underscore setup
 
         _.mixin(_.str.exports());
@@ -286,45 +360,68 @@ $(function() {
                 };
                 $(element).popover(options);
             }
-        }
-
-        ko.bindingHandlers.allowBindings = {
-        	init: function (elem, valueAccessor) {
-        		return { controlsDescendantBindings: !valueAccessor() };
-        	}
         };
 
-        ko.applyBindings(connectionViewModel, document.getElementById("connection_accordion"));
-        ko.applyBindings(printerStateViewModel, document.getElementById("state_accordion"));
-        ko.applyBindings(gcodeFilesViewModel, document.getElementById("files_accordion"));
-        ko.applyBindings(temperatureViewModel, document.getElementById("temp"));
-        ko.applyBindings(controlViewModel, document.getElementById("control"));
-        ko.applyBindings(terminalViewModel, document.getElementById("term"));
-        var gcode = document.getElementById("gcode");
-        if (gcode) {
-            gcodeViewModel.initialize();
-            ko.applyBindings(gcodeViewModel, gcode);
-        }
-        ko.applyBindings(settingsViewModel, document.getElementById("settings_dialog"));
-        ko.applyBindings(navigationViewModel, document.getElementById("navbar"));
-        ko.applyBindings(appearanceViewModel, document.getElementsByTagName("head")[0]);
-        ko.applyBindings(printerStateViewModel, document.getElementById("drop_overlay"));
-        ko.applyBindings(logViewModel, document.getElementById("logs"));
+        ko.bindingHandlers.allowBindings = {
+            init: function (elem, valueAccessor) {
+                return { controlsDescendantBindings: !valueAccessor() };
+            }
+        };
+        ko.virtualElements.allowedBindings.allowBindings = true;
 
-        var timelapseElement = document.getElementById("timelapse");
-        if (timelapseElement) {
-            ko.applyBindings(timelapseViewModel, timelapseElement);
-        }
+        ko.bindingHandlers.slimScrolledForeach = {
+            init: function(element, valueAccessor, allBindings, viewModel, bindingContext) {
+                return ko.bindingHandlers.foreach.init(element, valueAccessor(), allBindings, viewModel, bindingContext);
+            },
+            update: function(element, valueAccessor, allBindings, viewModel, bindingContext) {
+                setTimeout(function() {
+                    $(element).slimScroll({scrollBy: 0});
+                }, 10);
+                return ko.bindingHandlers.foreach.update(element, valueAccessor(), allBindings, viewModel, bindingContext);
+            }
+        };
+
+        ko.bindingHandlers.qrcode = {
+            update: function(element, valueAccessor, allBindings, viewModel, bindingContext) {
+                var val = ko.utils.unwrapObservable(valueAccessor());
+
+                var defaultOptions = {
+                    text: "",
+                    size: 200,
+                    fill: "#000",
+                    background: null,
+                    label: "",
+                    fontname: "sans",
+                    fontcolor: "#000",
+                    radius: 0,
+                    ecLevel: "L"
+                };
+
+                var options = {};
+                _.each(defaultOptions, function(value, key) {
+                    options[key] = ko.utils.unwrapObservable(val[key]) || value;
+                });
+
+                $(element).empty().qrcode(options);
+            }
+        };
+
+        ko.bindingHandlers.invisible = {
+            init: function(element, valueAccessor, allBindings, viewModel, bindingContext) {
+                if (!valueAccessor()) return;
+                ko.bindingHandlers.style.update(element, function() {
+                    return { visibility: 'hidden' };
+                })
+            }
+        };
 
         //~~ startup commands
 
-        loginStateViewModel.requestData();
-        connectionViewModel.requestData();
-        controlViewModel.requestData();
-        gcodeFilesViewModel.requestData();
-        timelapseViewModel.requestData();
-        settingsViewModel.requestData();
-        logViewModel.requestData();
+        _.each(allViewModels, function(viewModel) {
+            if (viewModel.hasOwnProperty("onStartup")) {
+                viewModel.onStartup();
+            }
+        });
 
         loginStateViewModel.subscribe(function(change, data) {
             if ("login" == change) {
@@ -338,24 +435,112 @@ $(function() {
             }
         });
 
+        //~~ view model binding
+
+        settingsViewModel.requestData(function() {
+            ko.applyBindings(settingsViewModel, document.getElementById("settings_dialog"));
+
+            ko.applyBindings(connectionViewModel, document.getElementById("connection_wrapper"));
+            ko.applyBindings(printerStateViewModel, document.getElementById("state_wrapper"));
+            ko.applyBindings(gcodeFilesViewModel, document.getElementById("files_wrapper"));
+            ko.applyBindings(temperatureViewModel, document.getElementById("temp"));
+            ko.applyBindings(controlViewModel, document.getElementById("control"));
+            ko.applyBindings(terminalViewModel, document.getElementById("term"));
+            var gcode = document.getElementById("gcode");
+            if (gcode) {
+                gcodeViewModel.initialize();
+                ko.applyBindings(gcodeViewModel, gcode);
+            }
+            //ko.applyBindings(settingsViewModel, document.getElementById("settings_dialog"));
+            ko.applyBindings(navigationViewModel, document.getElementById("navbar"));
+            ko.applyBindings(appearanceViewModel, document.getElementsByTagName("head")[0]);
+            ko.applyBindings(printerStateViewModel, document.getElementById("drop_overlay"));
+            ko.applyBindings(logViewModel, document.getElementById("logs"));
+
+            var timelapseElement = document.getElementById("timelapse");
+            if (timelapseElement) {
+                ko.applyBindings(timelapseViewModel, timelapseElement);
+            }
+
+            ko.applyBindings(slicingViewModel, document.getElementById("slicing_configuration_dialog"));
+
+            // apply bindings and signal startup
+            _.each(additionalViewModels, function(additionalViewModel) {
+                var viewModel = additionalViewModel[0];
+                var targets = additionalViewModel[1];
+
+                if (targets === undefined) {
+                    return;
+                }
+
+                if (!Array.isArray(targets)) {
+                    targets = [targets];
+                }
+
+                if (viewModel.hasOwnProperty("onBeforeBinding")) {
+                    viewModel.onBeforeBinding();
+                }
+
+                _.each(targets, function(target) {
+                    try {
+                        ko.applyBindings(viewModel, target);
+                    } catch (exc) {
+                        console.log("Could not apply bindings for additional view model " + viewModel + ": " + exc.message);
+                    }
+                });
+
+                if (viewModel.hasOwnProperty("onAfterBinding")) {
+                    viewModel.onAfterBinding();
+                }
+            });
+        });
+
         //~~ UI stuff
 
-        $(".accordion-toggle[href='#files']").click(function() {
-            if ($("#files").hasClass("in")) {
-                $("#files").removeClass("overflow_visible");
+        var webcamDisableTimeout;
+        $('#tabs a[data-toggle="tab"]').on('show', function (e) {
+            var current = e.target;
+            var previous = e.relatedTarget;
+
+            if (current.hash == "#control") {
+                clearTimeout(webcamDisableTimeout);
+                var webcamImage = $("#webcam_image");
+                var currentSrc = webcamImage.attr("src");
+                if (currentSrc === undefined || currentSrc.trim() == "") {
+                    var newSrc = CONFIG_WEBCAM_STREAM;
+                    if (CONFIG_WEBCAM_STREAM.lastIndexOf("?") > -1) {
+                        newSrc += "&";
+                    } else {
+                        newSrc += "?";
+                    }
+                    newSrc += new Date().getTime();
+
+                    webcamImage.attr("src", newSrc);
+                }
+            } else if (previous.hash == "#control") {
+                // only disable webcam stream if tab is out of focus for more than 5s, otherwise we might cause
+                // more load by the constant connection creation than by the actual webcam stream
+                webcamDisableTimeout = setTimeout(function() {
+                    $("#webcam_image").attr("src", "");
+                }, 5000);
+            }
+        });
+
+        $(".accordion-toggle[data-target='#files']").click(function() {
+            var files = $("#files");
+            if (files.hasClass("in")) {
+                files.removeClass("overflow_visible");
             } else {
                 setTimeout(function() {
-                    $("#files").addClass("overflow_visible");
-                }, 1000);
+                    files.addClass("overflow_visible");
+                }, 100);
             }
-        })
-
-        $.pnotify.defaults.history = false;
+        });
 
         $.fn.modal.defaults.maxHeight = function(){
             // subtract the height of the modal header and footer
             return $(window).height() - 165;
-        }
+        };
 
         // Fix input element click problem on login dialog
         $(".dropdown input, .dropdown label").click(function(e) {
@@ -382,6 +567,7 @@ $(function() {
             ko.applyBindings(firstRunViewModel, document.getElementById("first_run_dialog"));
             firstRunViewModel.showDialog();
         }
+
     }
 );
 

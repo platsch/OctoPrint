@@ -8,10 +8,14 @@ import sys
 import time
 import re
 import tempfile
+import logging
+import shutil
 from flask import make_response
 
 from octoprint.settings import settings, default_settings
 
+
+logger = logging.getLogger(__name__)
 
 def getFormattedSize(num):
 	"""
@@ -129,7 +133,7 @@ def getDosFilename(input, existingFilenames, extension=None):
 
 
 def findCollisionfreeName(input, extension, existingFilenames):
-	filename = re.sub(r"\s+", "_", input.lower().translate(None, ".\"/\\[]:;=,"))
+	filename = re.sub(r"\s+", "_", input.lower().translate({ord(i):None for i in ".\"/\\[]:;=,"}))
 
 	counter = 1
 	power = 1
@@ -144,7 +148,7 @@ def findCollisionfreeName(input, extension, existingFilenames):
 	raise ValueError("Can't create a collision free filename")
 
 
-def safeRename(old, new):
+def safeRename(old, new, throw_error=False):
 	"""
 	Safely renames a file.
 
@@ -169,14 +173,17 @@ def safeRename(old, new):
 				os.rename(new, backup)
 			os.rename(old, new)
 			os.remove(backup)
-		except OSError:
+		except OSError as e:
 			# if anything went wrong, try to rename the backup file to its original name
+			logger.error("Could not perform safe rename, trying to revert")
 			if os.path.exists(backup):
-				os.remove(new)
-			os.rename(backup, new)
+				silentRemove(new)
+				os.rename(backup, new)
+			if throw_error:
+				raise e
 	else:
 		# on anything else than windows it's ooooh so much easier...
-		os.rename(old, new)
+		shutil.move(old, new)
 
 
 def silentRemove(file):
@@ -224,4 +231,87 @@ def getJsonCommandFromRequest(request, valid_commands):
 			return None, None, make_response("Mandatory parameter %s missing for command %s" % (parameter, command), 400)
 
 	return command, data, None
+
+
+def dict_merge(a, b):
+	'''recursively merges dict's. not just simple a['key'] = b['key'], if
+	both a and bhave a key who's value is a dict then dict_merge is called
+	on both values and the result stored in the returned dictionary.
+
+	Taken from https://www.xormedia.com/recursively-merge-dictionaries-in-python/'''
+
+	from copy import deepcopy
+
+	if not isinstance(b, dict):
+		return b
+	result = deepcopy(a)
+	for k, v in b.iteritems():
+		if k in result and isinstance(result[k], dict):
+			result[k] = dict_merge(result[k], v)
+		else:
+			result[k] = deepcopy(v)
+	return result
+
+
+def dict_clean(a, b):
+
+	from copy import deepcopy
+	if not isinstance(b, dict):
+		return a
+
+	result = deepcopy(a)
+	for k, v in a.iteritems():
+		if not k in b:
+			del result[k]
+		elif isinstance(v, dict):
+			result[k] = dict_clean(v, b[k])
+		else:
+			result[k] = deepcopy(v)
+	return result
+
+
+def dict_contains_keys(a, b):
+	if not isinstance(a, dict) or not isinstance(b, dict):
+		return False
+
+	for k, v in a.iteritems():
+		if not k in b:
+			return False
+		elif isinstance(v, dict):
+			if not dict_contains_keys(v, b[k]):
+				return False
+
+	return True
+
+
+class Object(object):
+	pass
+
+def interface_addresses(family=None):
+	import netifaces
+	if not family:
+		family = netifaces.AF_INET
+
+	for interface in netifaces.interfaces():
+		try:
+			ifaddresses = netifaces.ifaddresses(interface)
+		except:
+			continue
+		if family in ifaddresses:
+			for ifaddress in ifaddresses[family]:
+				if not ifaddress["addr"].startswith("169.254."):
+					yield ifaddress["addr"]
+
+def address_for_client(host, port):
+	import socket
+
+	for address in interface_addresses():
+		try:
+			sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+			sock.bind((address, 0))
+			sock.connect((host, port))
+			return address
+		except Exception as e:
+			pass
+
 

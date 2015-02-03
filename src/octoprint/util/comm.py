@@ -13,6 +13,7 @@ import threading
 import Queue as queue
 import logging
 import serial
+import octoprint.plugin
 
 from collections import deque
 
@@ -21,8 +22,8 @@ from octoprint.util.avr_isp import ispBase
 
 from octoprint.settings import settings
 from octoprint.events import eventManager, Events
+from octoprint.filemanager import valid_file_type
 from octoprint.filemanager.destinations import FileDestinations
-from octoprint.gcodefiles import isGcodeFileName
 from octoprint.util import getExceptionString, getNewTimeout, sanitizeAscii, filterNonAscii
 from octoprint.util.virtual import VirtualPrinter
 
@@ -76,6 +77,8 @@ gcodeToEvent = {
 	"M226": Events.WAITING,
 	"M0": Events.WAITING,
 	"M1": Events.WAITING,
+	# dwell command
+	"G4": Events.DWELL,
 
 	# part cooler
 	"M245": Events.COOLING,
@@ -142,14 +145,23 @@ class MachineCom(object):
 		self._bedTempOffset = 0
 		self._commandQueue = queue.Queue()
 		self._currentZ = None
-		self._heatupWaitStartTime = 0
+		self._heatupWaitStartTime = None
 		self._heatupWaitTimeLost = 0.0
+		self._pauseWaitStartTime = None
+		self._pauseWaitTimeLost = 0.0
 		self._currentExtruder = 0
+
+		self._timeout = None
 
 		self._alwaysSendChecksum = settings().getBoolean(["feature", "alwaysSendChecksum"])
 		self._currentLine = 1
 		self._resendDelta = None
 		self._lastLines = deque([], 50)
+
+		# hooks
+		self._pluginManager = octoprint.plugin.plugin_manager()
+		self._gcode_hooks = self._pluginManager.get_hooks("octoprint.comm.protocol.gcode")
+		self._printer_action_hooks = self._pluginManager.get_hooks("octoprint.comm.protocol.action")
 
 		# SD status data
 		self._sdAvailable = False
@@ -304,20 +316,17 @@ class MachineCom(object):
 		if self._currentFile is None or self._currentFile.getStartTime() is None:
 			return None
 		else:
-			return time.time() - self._currentFile.getStartTime()
+			return time.time() - self._currentFile.getStartTime() - self._pauseWaitTimeLost
 
-	def getPrintTimeRemainingEstimate(self):
+	def getCleanedPrintTime(self):
 		printTime = self.getPrintTime()
 		if printTime is None:
 			return None
 
-		printTime /= 60
-		progress = self._currentFile.getProgress()
-		if progress:
-			printTimeTotal = printTime / progress
-			return printTimeTotal - printTime
-		else:
-			return None
+		cleanedPrintTime = printTime - self._heatupWaitTimeLost
+		if cleanedPrintTime < 0:
+			cleanedPrintTime = 0.0
+		return cleanedPrintTime
 
 	def getTemp(self):
 		return self._temp
@@ -378,6 +387,11 @@ class MachineCom(object):
 		if self._currentFile is None:
 			raise ValueError("No file selected for printing")
 
+		self._heatupWaitStartTime = 0
+		self._heatupWaitTimeLost = 0.0
+		self._pauseWaitStartTime = 0
+		self._pauseWaitTimeLost = 0.0
+
 		try:
 			self._currentFile.start()
 
@@ -397,6 +411,7 @@ class MachineCom(object):
 			else:
 				self._sendNext()
 		except:
+			self._logger.exception("Error while trying to start printing")
 			self._errorValue = getExceptionString()
 			self._changeState(self.STATE_ERROR)
 			eventManager().fire(Events.ERROR, {"error": self.getErrorString()})
@@ -459,6 +474,10 @@ class MachineCom(object):
 			return
 
 		if not pause and self.isPaused():
+			if self._pauseWaitStartTime:
+				self._pauseWaitTimeLost = self._pauseWaitTimeLost + (time.time() - self._pauseWaitStartTime)
+				self._pauseWaitStartTime = None
+
 			self._changeState(self.STATE_PRINTING)
 			if self.isSdFileSelected():
 				self.sendCommand("M24")
@@ -471,6 +490,9 @@ class MachineCom(object):
 				"origin": self._currentFile.getFileLocation()
 			})
 		elif pause and self.isPrinting():
+			if not self._pauseWaitStartTime:
+				self._pauseWaitStartTime = time.time()
+
 			self._changeState(self.STATE_PAUSED)
 			if self.isSdFileSelected():
 				self.sendCommand("M25") # pause print
@@ -566,8 +588,8 @@ class MachineCom(object):
 		maxToolNum, parsedTemps = self._parseTemperatures(line)
 
 		# extruder temperatures
-		if not "T0" in parsedTemps.keys() and "T" in parsedTemps.keys():
-			# only single reporting, "T" is our one and only extruder temperature
+		if not "T0" in parsedTemps.keys() and not "T1" in parsedTemps.keys() and "T" in parsedTemps.keys():
+			# no T1 so only single reporting, "T" is our one and only extruder temperature
 			toolNum, actual, target = parsedTemps["T"]
 
 			if target is not None:
@@ -577,7 +599,13 @@ class MachineCom(object):
 				self._temp[0] = (actual, oldTarget)
 			else:
 				self._temp[0] = (actual, None)
-		elif "T0" in parsedTemps.keys():
+		elif not "T0" in parsedTemps.keys() and "T" in parsedTemps.keys():
+			# Smoothieware sends multi extruder temperature data this way: "T:<first extruder> T1:<second extruder> ..." and therefore needs some special treatment...
+			_, actual, target = parsedTemps["T"]
+			del parsedTemps["T"]
+			parsedTemps["T0"] = (0, actual, target)
+
+		if "T0" in parsedTemps.keys():
 			for n in range(maxToolNum + 1):
 				tool = "T%d" % n
 				if not tool in parsedTemps.keys():
@@ -620,9 +648,11 @@ class MachineCom(object):
 			self._changeState(self.STATE_CONNECTING)
 
 		#Start monitoring the serial port.
-		timeout = getNewTimeout("communication")
+		self._timeout = getNewTimeout("communication")
+
 		tempRequestTimeout = getNewTimeout("temperature")
 		sdStatusRequestTimeout = getNewTimeout("sdStatus")
+
 		startSeen = not settings().getBoolean(["feature", "waitForStartOnConnect"])
 		heatingUp = False
 		swallowOk = False
@@ -634,20 +664,57 @@ class MachineCom(object):
 				if line is None:
 					break
 				if line.strip() is not "":
-					timeout = getNewTimeout("communication")
+					self._timeout = getNewTimeout("communication")
+
+				##~~ debugging output handling
+				if line.startswith("//"):
+					debugging_output = line[2:].strip()
+					if debugging_output.startswith("action:"):
+						action_command = debugging_output[len("action:"):].strip()
+
+						if action_command == "pause":
+							self._log("Pausing on request of the printer...")
+							self.setPause(True)
+						elif action_command == "resume":
+							self._log("Resuming on request of the printer...")
+							self.setPause(False)
+						elif action_command == "disconnect":
+							self._log("Disconnecting on request of the printer...")
+							self._callback.mcForceDisconnect()
+						else:
+							for hook in self._printer_action_hooks:
+								self._printer_action_hooks[hook](self, line, action_command)
+					else:
+						continue
 
 				##~~ Error handling
 				line = self._handleErrors(line)
 
 				##~~ SD file list
 				# if we are currently receiving an sd file list, each line is just a filename, so just read it and abort processing
-				if self._sdFileList and isGcodeFileName(line.strip().lower()) and not 'End file list' in line:
-					filename = line.strip().lower()
-					if filterNonAscii(filename):
-						self._logger.warn("Got a file from printer's SD that has a non-ascii filename (%s), that shouldn't happen according to the protocol" % filename)
+				if self._sdFileList and not "End file list" in line:
+					preprocessed_line = line.strip().lower()
+					fileinfo = preprocessed_line.rsplit(None, 1)
+					if len(fileinfo) > 1:
+						# we might have extended file information here, so let's split filename and size and try to make them a bit nicer
+						filename, size = fileinfo
+						try:
+							size = int(size)
+						except ValueError:
+							# whatever that was, it was not an integer, so we'll just use the whole line as filename and set size to None
+							filename = preprocessed_line
+							size = None
 					else:
-						self._sdFiles.append(filename)
-					continue
+						# no extended file information, so only the filename is there and we set size to None
+						filename = preprocessed_line
+						size = None
+
+					if valid_file_type(filename, "gcode"):
+						if filterNonAscii(filename):
+							self._logger.warn("Got a file from printer's SD that has a non-ascii filename (%s), that shouldn't happen according to the protocol" % filename)
+						else:
+							self._sdFiles.append((filename, size))
+						continue
 
 				##~~ Temperature processing
 				if ' T:' in line or line.startswith('T:') or ' T0:' in line or line.startswith('T0:'):
@@ -655,13 +722,10 @@ class MachineCom(object):
 					self._callback.mcTempUpdate(self._temp, self._bedTemp)
 
 					#If we are waiting for an M109 or M190 then measure the time we lost during heatup, so we can remove that time from our printing time estimate.
-					if not 'ok' in line:
-						heatingUp = True
-						if self._heatupWaitStartTime != 0:
-							t = time.time()
-							self._heatupWaitTimeLost = t - self._heatupWaitStartTime
-							self._heatupWaitStartTime = t
-				elif supportRepetierTargetTemp:
+					if 'ok' in line and self._heatupWaitStartTime:
+						self._heatupWaitTimeLost = self._heatupWaitTimeLost + (time.time() - self._heatupWaitStartTime)
+						self._heatupWaitStartTime = None
+				elif supportRepetierTargetTemp and ('TargetExtr' in line or 'TargetBed' in line):
 					matchExtr = self._regex_repetierTempExtr.match(line)
 					matchBed = self._regex_repetierTempBed.match(line)
 
@@ -790,7 +854,7 @@ class MachineCom(object):
 
 				### Baudrate detection
 				if self._state == self.STATE_DETECT_BAUDRATE:
-					if line == '' or time.time() > timeout:
+					if line == '' or time.time() > self._timeout:
 						if len(self._baudrateDetectList) < 1:
 							self.close()
 							self._errorValue = "No more baudrates to test, and no suitable baudrate found."
@@ -810,7 +874,7 @@ class MachineCom(object):
 								self._log("Trying baudrate: %d" % (baudrate))
 								self._baudrateDetectRetry = 5
 								self._baudrateDetectTestOk = 0
-								timeout = getNewTimeout("communication")
+								self._timeout = getNewTimeout("communication")
 								self._serial.write('\n')
 								self._sendCommand("M105")
 								self._testingBaudrate = True
@@ -846,7 +910,7 @@ class MachineCom(object):
 						else:
 							self.initSdCard()
 						eventManager().fire(Events.CONNECTED, {"port": self._port, "baudrate": self._baudrate})
-					elif time.time() > timeout:
+					elif time.time() > self._timeout:
 						self.close()
 
 				### Operational
@@ -868,7 +932,7 @@ class MachineCom(object):
 
 				### Printing
 				elif self._state == self.STATE_PRINTING:
-					if line == "" and time.time() > timeout:
+					if line == "" and time.time() > self._timeout:
 						self._log("Communication timeout during printing, forcing a line")
 						line = 'ok'
 
@@ -892,7 +956,7 @@ class MachineCom(object):
 							if self._resendDelta is not None:
 								self._resendNextCommand()
 							elif not self._commandQueue.empty() and not self.isStreaming():
-								self._sendCommand(self._commandQueue.get())
+								self._sendCommand(self._commandQueue.get(), True)
 							else:
 								self._sendNext()
 						elif line.lower().startswith("resend") or line.lower().startswith("rs"):
@@ -940,7 +1004,7 @@ class MachineCom(object):
 			try:
 				self._log("Connecting to: %s" % self._port)
 				if self._baudrate == 0:
-					self._serial = serial.Serial(str(self._port), 115200, timeout=0.1, writeTimeout=10000)
+					self._serial = serial.Serial(str(self._port), 115200, timeout=settings().getFloat(["serial", "timeout", "connection"]), writeTimeout=10000)
 				else:
 					self._serial = serial.Serial(str(self._port), self._baudrate, timeout=settings().getFloat(["serial", "timeout", "connection"]), writeTimeout=10000)
 			except:
@@ -953,7 +1017,7 @@ class MachineCom(object):
 
 	def _handleErrors(self, line):
 		# No matter the state, if we see an error, goto the error state and store the error for reference.
-		if line.startswith('Error:'):
+		if line.startswith('Error:') or line.startswith('!!'):
 			#Oh YEAH, consistency.
 			# Marlin reports an MIN/MAX temp error as "Error:x\n: Extruder switched off. MAXTEMP triggered !\n"
 			#	But a bed temp error is reported as "Error: Temperature heated bed switched off. MAXTEMP triggered !!"
@@ -998,16 +1062,16 @@ class MachineCom(object):
 				if self.isStreaming():
 					self._sendCommand("M29")
 
-					filename = self._currentFile.getFilename()
+					remote = self._currentFile.getRemoteFilename()
 					payload = {
 						"local": self._currentFile.getLocalFilename(),
-						"remote": self._currentFile.getRemoteFilename(),
+						"remote": remote,
 						"time": self.getPrintTime()
 					}
 
 					self._currentFile = None
 					self._changeState(self.STATE_OPERATIONAL)
-					self._callback.mcFileTransferDone(filename)
+					self._callback.mcFileTransferDone(remote)
 					eventManager().fire(Events.TRANSFER_DONE, payload)
 					self.refreshSdFiles()
 				else:
@@ -1068,6 +1132,10 @@ class MachineCom(object):
 				return
 
 			if not self.isStreaming():
+				for hook in self._gcode_hooks:
+					hook_cmd = self._gcode_hooks[hook](self, cmd)
+					if hook_cmd and isinstance(hook_cmd, basestring):
+						cmd = hook_cmd
 				gcode = self._regex_command.search(cmd)
 				if gcode:
 					gcode = gcode.group(1)
@@ -1201,8 +1269,24 @@ class MachineCom(object):
 		self._resendDelta = None
 
 		return None
+
 	def _gcode_M112(self, cmd): # It's an emergency what todo? Canceling the print should be the minimum
 		self.cancelPrint()
+		return cmd
+
+	def _gcode_G4(self, cmd):
+		# we are intending to dwell for a period of time, increase the timeout to match
+		cmd = cmd.upper()
+		p_idx = cmd.find('P')
+		s_idx = cmd.find('S')
+		_timeout = 0
+		if p_idx != -1:
+			# dwell time is specified in milliseconds
+			_timeout = int(cmd[p_idx+1:]) / 1000.0
+		elif s_idx != -1:
+			# dwell time is specified in seconds
+			_timeout = int(cmd[s_idx+1:])
+		self._timeout = getNewTimeout("communication") + _timeout
 		return cmd
 
 ### MachineCom callback ################################################################################################
@@ -1242,6 +1326,9 @@ class MachineComPrintCallback(object):
 		pass
 
 	def mcReceivedRegisteredMessage(self, command, message):
+		pass
+
+	def mcForceDisconnect(self):
 		pass
 
 ### Printing file information classes ##################################################################################
@@ -1344,9 +1431,9 @@ class PrintingGcodeFileInformation(PrintingFileInformation):
 		"""
 		Opens the file for reading and determines the file size. Start time won't be recorded until 100 lines in
 		"""
+		PrintingFileInformation.start(self)
 		self._filehandle = open(self._filename, "r")
 		self._lineCount = None
-		self._startTime = None
 
 	def getNext(self):
 		"""
@@ -1372,9 +1459,6 @@ class PrintingGcodeFileInformation(PrintingFileInformation):
 				processedLine = self._processLine(line)
 			self._lineCount += 1
 			self._filepos = self._filehandle.tell()
-
-			if self._lineCount >= 100 and self._startTime is None:
-				self._startTime = time.time()
 
 			return processedLine
 		except Exception as (e):

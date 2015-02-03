@@ -1,86 +1,52 @@
-function SettingsViewModel(loginStateViewModel, usersViewModel) {
+function SettingsViewModel(loginStateViewModel, usersViewModel, printerProfilesViewModel) {
     var self = this;
 
     self.loginState = loginStateViewModel;
     self.users = usersViewModel;
+    self.printerProfiles = printerProfilesViewModel;
 
     self.api_enabled = ko.observable(undefined);
     self.api_key = ko.observable(undefined);
+    self.api_allowCrossOrigin = ko.observable(undefined);
 
     self.appearance_name = ko.observable(undefined);
     self.appearance_color = ko.observable(undefined);
 
-    self.appearance_available_colors = ko.observable(["default", "red", "orange", "yellow", "green", "blue", "violet", "black"]);
+    self.appearance_available_colors = ko.observable([
+        {key: "default", name: gettext("default")},
+        {key: "red", name: gettext("red")},
+        {key: "orange", name: gettext("orange")},
+        {key: "yellow", name: gettext("yellow")},
+        {key: "green", name: gettext("green")},
+        {key: "blue", name: gettext("blue")},
+        {key: "violet", name: gettext("violet")},
+        {key: "black", name: gettext("black")}
+    ]);
 
-    self.printer_movementSpeedX = ko.observable(undefined);
-    self.printer_movementSpeedY = ko.observable(undefined);
-    self.printer_movementSpeedZ = ko.observable(undefined);
-    self.printer_movementSpeedE = ko.observable(undefined);
-    self.printer_invertAxes = ko.observable(undefined);
-    self.printer_numExtruders = ko.observable(undefined);
-
-    self._printer_extruderOffsets = ko.observableArray([]);
-    self.printer_extruderOffsets = ko.computed({
-        read: function() {
-            var extruderOffsets = self._printer_extruderOffsets();
-            var result = [];
-            for (var i = 0; i < extruderOffsets.length; i++) {
-                result[i] = {
-                    x: parseFloat(extruderOffsets[i].x()),
-                    y: parseFloat(extruderOffsets[i].y())
-                }
-            }
-            return result;
-        },
-        write: function(value) {
-            var result = [];
-            if (value && Array.isArray(value)) {
-                for (var i = 0; i < value.length; i++) {
-                    result[i] = {
-                        x: ko.observable(value[i].x),
-                        y: ko.observable(value[i].y)
-                    }
-                }
-            }
-            self._printer_extruderOffsets(result);
-        },
-        owner: self
-    });
-    self.ko_printer_extruderOffsets = ko.computed(function() {
-        var extruderOffsets = self._printer_extruderOffsets();
-        var numExtruders = self.printer_numExtruders();
-        if (!numExtruders) {
-            numExtruders = 1;
+    self.appearance_colorName = function(color) {
+        switch (color) {
+            case "red":
+                return gettext("red");
+            case "orange":
+                return gettext("orange");
+            case "yellow":
+                return gettext("yellow");
+            case "green":
+                return gettext("green");
+            case "blue":
+                return gettext("blue");
+            case "violet":
+                return gettext("violet");
+            case "black":
+                return gettext("black");
+            case "default":
+                return gettext("default");
+            default:
+                return color;
         }
+    };
 
-        if (numExtruders > extruderOffsets.length) {
-            for (var i = extruderOffsets.length; i < numExtruders; i++) {
-                extruderOffsets[i] = {
-                    x: ko.observable(0),
-                    y: ko.observable(0)
-                }
-            }
-            self._printer_extruderOffsets(extruderOffsets);
-        }
-
-        return extruderOffsets.slice(0, numExtruders);
-    });
-
-    self.printer_bedDimensionX = ko.observable(undefined);
-    self.printer_bedDimensionY = ko.observable(undefined);
-    self.printer_bedDimensions = ko.computed({
-        read: function () {
-            return {
-                x: parseFloat(self.printer_bedDimensionX()),
-                y: parseFloat(self.printer_bedDimensionY())
-            };
-        },
-        write: function(value) {
-            self.printer_bedDimensionX(value.x);
-            self.printer_bedDimensionY(value.y);
-        },
-        owner: self
-    });
+    self.printer_defaultExtrusionLength = ko.observable(undefined);
 
     self.webcam_streamUrl = ko.observable(undefined);
     self.webcam_snapshotUrl = ko.observable(undefined);
@@ -98,6 +64,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     self.feature_sdAlwaysAvailable = ko.observable(undefined);
     self.feature_swallowOkAfterResend = ko.observable(undefined);
     self.feature_repetierTargetTemp = ko.observable(undefined);
+    self.feature_keyboardControl = ko.observable(undefined);
 
     self.serial_port = ko.observable();
     self.serial_baudrate = ko.observable();
@@ -115,16 +82,15 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     self.folder_timelapse = ko.observable(undefined);
     self.folder_timelapseTmp = ko.observable(undefined);
     self.folder_logs = ko.observable(undefined);
-
-    self.cura_enabled = ko.observable(undefined);
-    self.cura_path = ko.observable(undefined);
-    self.cura_config = ko.observable(undefined);
+    self.folder_watched = ko.observable(undefined);
 
     self.temperature_profiles = ko.observableArray(undefined);
 
     self.system_actions = ko.observableArray([]);
 
     self.terminalFilters = ko.observableArray([]);
+
+    self.settings = undefined;
 
     self.addTemperatureProfile = function() {
         self.temperature_profiles.push({name: "New", extruder:0, bed:0});
@@ -142,31 +108,10 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.terminalFilters.remove(filter);
     };
 
-    self.getPrinterInvertAxis = function(axis) {
-        return _.contains((self.printer_invertAxes() || []), axis.toLowerCase());
+    self.onSettingsShown = function() {
+      self.requestData();
     };
-
-    self.setPrinterInvertAxis = function(axis, value) {
-        var currInvert = self.printer_invertAxes() || [];
-        var currValue = self.getPrinterInvertAxis(axis);
-        if (value && !currValue) {
-            currInvert.push(axis.toLowerCase());
-        } else if (!value && currValue) {
-            currInvert = _.without(currInvert, axis.toLowerCase());
-        }
-        self.printer_invertAxes(currInvert);
-    };
-
-    self.koInvertAxis = function (axis) { return ko.computed({
-        read: function () { return self.getPrinterInvertAxis(axis); },
-        write: function (value) { self.setPrinterInvertAxis(axis, value); },
-        owner: self
-    })};
-
-    self.printer_invertX = self.koInvertAxis('x');
-    self.printer_invertY = self.koInvertAxis('y');
-    self.printer_invertZ = self.koInvertAxis('z');
-
+     
     self.requestData = function(callback) {
         $.ajax({
             url: API_BASEURL + "settings",
@@ -180,20 +125,20 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     };
 
     self.fromResponse = function(response) {
+        if (self.settings === undefined) {
+            self.settings = ko.mapping.fromJS(response);
+        } else {
+            ko.mapping.fromJS(response, self.settings);
+        }
+
         self.api_enabled(response.api.enabled);
         self.api_key(response.api.key);
+        self.api_allowCrossOrigin(response.api.allowCrossOrigin);
 
         self.appearance_name(response.appearance.name);
         self.appearance_color(response.appearance.color);
 
-        self.printer_movementSpeedX(response.printer.movementSpeedX);
-        self.printer_movementSpeedY(response.printer.movementSpeedY);
-        self.printer_movementSpeedZ(response.printer.movementSpeedZ);
-        self.printer_movementSpeedE(response.printer.movementSpeedE);
-        self.printer_invertAxes(response.printer.invertAxes);
-        self.printer_numExtruders(response.printer.numExtruders);
-        self.printer_extruderOffsets(response.printer.extruderOffsets);
-        self.printer_bedDimensions(response.printer.bedDimensions);
+        self.printer_defaultExtrusionLength(response.printer.defaultExtrusionLength);
 
         self.webcam_streamUrl(response.webcam.streamUrl);
         self.webcam_snapshotUrl(response.webcam.snapshotUrl);
@@ -211,6 +156,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.feature_sdAlwaysAvailable(response.feature.sdAlwaysAvailable);
         self.feature_swallowOkAfterResend(response.feature.swallowOkAfterResend);
         self.feature_repetierTargetTemp(response.feature.repetierTargetTemp);
+        self.feature_keyboardControl(response.feature.keyboardControl);
 
         self.serial_port(response.serial.port);
         self.serial_baudrate(response.serial.baudrate);
@@ -228,10 +174,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.folder_timelapse(response.folder.timelapse);
         self.folder_timelapseTmp(response.folder.timelapseTmp);
         self.folder_logs(response.folder.logs);
-
-        self.cura_enabled(response.cura.enabled);
-        self.cura_path(response.cura.path);
-        self.cura_config(response.cura.config);
+        self.folder_watched(response.folder.watched);
 
         self.temperature_profiles(response.temperature.profiles);
 
@@ -241,24 +184,20 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     };
 
     self.saveData = function() {
-        var data = {
+        var data = ko.mapping.toJS(self.settings);
+
+        data = _.extend(data, {
             "api" : {
                 "enabled": self.api_enabled(),
-                "key": self.api_key()
+                "key": self.api_key(),
+                "allowCrossOrigin": self.api_allowCrossOrigin()
             },
             "appearance" : {
                 "name": self.appearance_name(),
                 "color": self.appearance_color()
             },
             "printer": {
-                "movementSpeedX": self.printer_movementSpeedX(),
-                "movementSpeedY": self.printer_movementSpeedY(),
-                "movementSpeedZ": self.printer_movementSpeedZ(),
-                "movementSpeedE": self.printer_movementSpeedE(),
-                "invertAxes": self.printer_invertAxes(),
-                "numExtruders": self.printer_numExtruders(),
-                "extruderOffsets": self.printer_extruderOffsets(),
-                "bedDimensions": self.printer_bedDimensions()
+                "defaultExtrusionLength": self.printer_defaultExtrusionLength()
             },
             "webcam": {
                 "streamUrl": self.webcam_streamUrl(),
@@ -277,7 +216,8 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 "sdSupport": self.feature_sdSupport(),
                 "sdAlwaysAvailable": self.feature_sdAlwaysAvailable(),
                 "swallowOkAfterResend": self.feature_swallowOkAfterResend(),
-                "repetierTargetTemp": self.feature_repetierTargetTemp()
+                "repetierTargetTemp": self.feature_repetierTargetTemp(),
+                "keyboardControl": self.feature_keyboardControl()
             },
             "serial": {
                 "port": self.serial_port(),
@@ -294,7 +234,8 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 "uploads": self.folder_uploads(),
                 "timelapse": self.folder_timelapse(),
                 "timelapseTmp": self.folder_timelapseTmp(),
-                "logs": self.folder_logs()
+                "logs": self.folder_logs(),
+                "watched": self.folder_watched()
             },
             "temperature": {
                 "profiles": self.temperature_profiles()
@@ -302,13 +243,8 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
             "system": {
                 "actions": self.system_actions()
             },
-            "cura": {
-                "enabled": self.cura_enabled(),
-                "path": self.cura_path(),
-                "config": self.cura_config()
-            },
             "terminalFilters": self.terminalFilters()
-        };
+        });
 
         $.ajax({
             url: API_BASEURL + "settings",
@@ -321,6 +257,5 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 $("#settings_dialog").modal("hide");
             }
         });
-    }
-
+    };
 }

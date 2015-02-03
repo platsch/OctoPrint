@@ -1,4 +1,4 @@
-function AppearanceViewModel(settingsViewModel) {
+function AppearanceViewModel(settingsViewModel, printerStateViewModel) {
     var self = this;
 
     self.name = settingsViewModel.appearance_name;
@@ -6,15 +6,15 @@ function AppearanceViewModel(settingsViewModel) {
 
     self.brand = ko.computed(function() {
         if (self.name())
-            return "OctoPrint: " + self.name();
+            return gettext("OctoPrint") + ": " + self.name();
         else
-            return "OctoPrint";
-    })
+            return gettext("OctoPrint");
+    });
 
     self.title = ko.computed(function() {
         if (self.name())
-            return self.name() + " [OctoPrint]";
+            return self.name() + " [" + gettext("OctoPrint") + "]";
         else
-            return "OctoPrint";
-    })
+            return gettext("OctoPrint");
+    });
 }

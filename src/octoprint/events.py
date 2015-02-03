@@ -1,19 +1,26 @@
 # coding=utf-8
+from __future__ import (print_function, absolute_import)
 
-__author__ = "Lars Norpchen"
-__author__ = "Gina Häußge <osd@foosel.net>"
+__author__ = "Gina Häußge <osd@foosel.net>, Lars Norpchen"
 __license__ = 'GNU Affero General Public License http://www.gnu.org/licenses/agpl.html'
+__copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms of the AGPLv3 License"
 
 import datetime
 import logging
 import subprocess
 import Queue
 import threading
+import collections
 
 from octoprint.settings import settings
+import octoprint.plugin
 
 # singleton
 _instance = None
+
+
+def all_events():
+	return [getattr(Events, name) for name in Events.__dict__ if not name.startswith("__")]
 
 
 class Events(object):
@@ -35,6 +42,7 @@ class Events(object):
 	UPDATED_FILES = "UpdatedFiles"
 	METADATA_ANALYSIS_STARTED = "MetadataAnalysisStarted"
 	METADATA_ANALYSIS_FINISHED = "MetadataAnalysisFinished"
+	METADATA_STATISTICS_UPDATED = "MetadataStatisticsUpdated"
 
 	# SD Upload
 	TRANSFER_STARTED = "TransferStarted"
@@ -55,6 +63,7 @@ class Events(object):
 	HOME = "Home"
 	Z_CHANGE = "ZChange"
 	WAITING = "Waiting"
+	DWELL = "Dwelling"
 	COOLING = "Cooling"
 	ALERT = "Alert"
 	CONVEYOR = "Conveyor"
@@ -72,6 +81,10 @@ class Events(object):
 	SLICING_STARTED = "SlicingStarted"
 	SLICING_DONE = "SlicingDone"
 	SLICING_FAILED = "SlicingFailed"
+	SLICING_CANCELLED = "SlicingCancelled"
+
+	# Settings
+	SETTINGS_UPDATED = "SettingsUpdated"
 
 
 def eventManager():
@@ -87,7 +100,7 @@ class EventManager(object):
 	"""
 
 	def __init__(self):
-		self._registeredListeners = {}
+		self._registeredListeners = collections.defaultdict(list)
 		self._logger = logging.getLogger(__name__)
 
 		self._queue = Queue.PriorityQueue()
@@ -96,20 +109,25 @@ class EventManager(object):
 		self._worker.start()
 
 	def _work(self):
-		while True:
-			(event, payload) = self._queue.get(True)
+		try:
+			while True:
+				(event, payload) = self._queue.get(True)
 
-			eventListeners = self._registeredListeners.get(event, None)
-			if eventListeners is None:
-				return
-			self._logger.debug("Firing event: %s (Payload: %r)" % (event, payload))
+				eventListeners = self._registeredListeners[event]
+				self._logger.debug("Firing event: %s (Payload: %r)" % (event, payload))
 
-			for listener in eventListeners:
-				self._logger.debug("Sending action to %r" % listener)
-				try:
-					listener(event, payload)
-				except:
-					self._logger.exception("Got an exception while sending event %s (Payload: %r) to %s" % (event, payload, listener))
+				for listener in eventListeners:
+					self._logger.debug("Sending action to %r" % listener)
+					try:
+						listener(event, payload)
+					except:
+						self._logger.exception("Got an exception while sending event %s (Payload: %r) to %s" % (event, payload, listener))
+
+				octoprint.plugin.call_plugin(octoprint.plugin.types.EventHandlerPlugin,
+				                             "on_event",
+				                             args=[event, payload])
+		except:
+			self._logger.exception("Ooops, the event bus worker loop crashed")
 
 	def fire(self, event, payload=None):
 		"""
@@ -122,17 +140,21 @@ class EventManager(object):
 		payload being a payload object specific to the event.
 		"""
 
-		if not event in self._registeredListeners.keys():
-			return
 		self._queue.put((event, payload), 0)
+
+		if event == Events.UPDATED_FILES and "type" in payload and payload["type"] == "printables":
+			# when sending UpdatedFiles with type "printables", also send another event with deprecated type "gcode"
+			# TODO v1.3.0 Remove again
+			import copy
+			legacy_payload = copy.deepcopy(payload)
+			legacy_payload["type"] = "gcode"
+			self._queue.put((event, legacy_payload), 0)
+
 
 	def subscribe(self, event, callback):
 		"""
 		Subscribe a listener to an event -- pass in the event name (as a string) and the callback object
 		"""
-
-		if not event in self._registeredListeners.keys():
-			self._registeredListeners[event] = []
 
 		if callback in self._registeredListeners[event]:
 			# callback is already subscribed to the event
@@ -145,10 +167,6 @@ class EventManager(object):
 		"""
 		Unsubscribe a listener from an event -- pass in the event name (as string) and the callback object
 		"""
-
-		if not event in self._registeredListeners:
-			# no callback registered for callback, just return
-			return
 
 		if not callback in self._registeredListeners[event]:
 			# callback not subscribed to event, just return
@@ -330,8 +348,8 @@ class CommandTrigger(GenericEventListener):
 		if "job" in currentData.keys() and currentData["job"] is not None:
 			params["__filename"] = currentData["job"]["file"]["name"]
 			if "progress" in currentData.keys() and currentData["progress"] is not None \
-				and "progress" in currentData["progress"].keys() and currentData["progress"]["progress"] is not None:
-				params["__progress"] = str(round(currentData["progress"]["progress"] * 100))
+				and "completion" in currentData["progress"].keys() and currentData["progress"]["completion"] is not None:
+				params["__progress"] = str(round(currentData["progress"]["completion"] * 100))
 
 		# now add the payload keys as well
 		if isinstance(payload, dict):

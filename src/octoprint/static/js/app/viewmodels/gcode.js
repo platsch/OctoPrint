@@ -10,15 +10,15 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
         var text = "";
         switch (self.ui_progress_type()) {
             case "loading": {
-                text = "Loading... (" + self.ui_progress_percentage().toFixed(0) + "%)";
+                text = gettext("Loading...") + " (" + self.ui_progress_percentage().toFixed(0) + "%)";
                 break;
             }
             case "analyzing": {
-                text = "Analyzing... (" + self.ui_progress_percentage().toFixed(0) + "%)";
+                text = gettext("Analyzing...") + " (" + self.ui_progress_percentage().toFixed(0) + "%)";
                 break;
             }
             case "done": {
-                text = "Analyzed";
+                text = gettext("Analyzed");
                 break;
             }
         }
@@ -95,41 +95,108 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
     self.reader_hideEmptyLayers.subscribe(self.synchronizeOptions);
 
     // subscribe to relevant printer settings...
-    self.settings.printer_extruderOffsets.subscribe(function() {
-        if (!self.enabled) return;
-        if (!self.settings.printer_extruderOffsets()) return;
-
-        GCODE.ui.updateOptions({
-            reader: {
-                toolOffsets: self.settings.printer_extruderOffsets()
-            }
-        });
-    });
-    self.settings.printer_bedDimensions.subscribe(function() {
+    self.settings.printerProfiles.currentProfileData.subscribe(function() {
         if (!self.enabled) return;
 
-        var bedDimensions = self.settings.printer_bedDimensions();
-        if (!bedDimensions || (!bedDimensions.hasOwnProperty("x") && !bedDimensions.hasOwnProperty("y") && !bedDimensions.hasOwnProperty("r"))) return;
+        var currentProfileData = self.settings.printerProfiles.currentProfileData();
+        if (!currentProfileData) return;
 
-        GCODE.ui.updateOptions({
-            renderer: {
-                bed: bedDimensions
-            }
-        });
-    });
-    self.settings.printer_invertAxes.subscribe(function() {
-        if (!self.enabled) return;
-        if (!self.settings.printer_invertAxes()) return;
-
-        GCODE.ui.updateOptions({
-            renderer: {
-                invertAxes: {
-                    x: self.settings.printer_invertX(),
-                    y: self.settings.printer_invertY()
+        var toolOffsets = self._retrieveToolOffsets(currentProfileData);
+        if (toolOffsets) {
+            GCODE.ui.updateOptions({
+                reader: {
+                    toolOffsets: toolOffsets
                 }
-            }
-        });
+            });
+
+        }
+
+        var bedDimensions = self._retrieveBedDimensions(currentProfileData);
+        if (toolOffsets) {
+            GCODE.ui.updateOptions({
+                renderer: {
+                    bed: bedDimensions
+                }
+            });
+        }
+
+        var axesConfiguration = self._retrieveAxesConfiguration(currentProfileData);
+        if (axesConfiguration) {
+            GCODE.ui.updateOptions({
+                renderer: {
+                    invertAxes: axesConfiguration
+                }
+            });
+        }
     });
+
+    self._retrieveBedDimensions = function(currentProfileData) {
+        if (currentProfileData == undefined) {
+            currentProfileData = self.settings.printerProfiles.currentProfileData();
+        }
+
+        if (currentProfileData && currentProfileData.volume && currentProfileData.volume.formFactor() && currentProfileData.volume.width() && currentProfileData.volume.depth()) {
+            var x = undefined, y = undefined, r = undefined, circular = false;
+
+            var formFactor = currentProfileData.volume.formFactor();
+            if (formFactor == "circular") {
+                r = currentProfileData.volume.width() / 2;
+                circular = true;
+            } else {
+                x = currentProfileData.volume.width();
+                y = currentProfileData.volume.depth();
+            }
+
+            return {
+                x: x,
+                y: y,
+                r: r,
+                circular: circular
+            };
+        } else {
+            return undefined;
+        }
+    };
+
+    self._retrieveToolOffsets = function(currentProfileData) {
+        if (currentProfileData == undefined) {
+            currentProfileData = self.settings.printerProfiles.currentProfileData();
+        }
+
+        if (currentProfileData && currentProfileData.extruder && currentProfileData.extruder.offsets()) {
+            var offsets = [];
+            _.each(currentProfileData.extruder.offsets(), function(offset) {
+                offsets.push({x: offset[0], y: offset[1]})
+            });
+            return offsets;
+        } else {
+            return undefined;
+        }
+
+    };
+
+    self._retrieveAxesConfiguration = function(currentProfileData) {
+        if (currentProfileData == undefined) {
+            currentProfileData = self.settings.printerProfiles.currentProfileData();
+        }
+
+        if (currentProfileData && currentProfileData.axes) {
+            var invertX = false, invertY = false;
+            if (currentProfileData.axes.x) {
+                invertX = currentProfileData.axes.x.inverted();
+            }
+            if (currentProfileData.axes.y) {
+                invertY = currentProfileData.axes.y.inverted();
+            }
+
+            return {
+                x: invertX,
+                y: invertY
+            }
+        } else {
+            return undefined;
+        }
+    };
 
     self.loadedFilename = undefined;
     self.loadedFileDate = undefined;
@@ -156,8 +223,9 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
                 onProgress: self._onProgress,
                 onModelLoaded: self._onModelLoaded,
                 onLayerSelected: self._onLayerSelected,
-                bed: self.settings.printer_bedDimensions(),
-                toolOffsets: self.settings.printer_extruderOffsets()
+                bed: self._retrieveBedDimensions(),
+                toolOffsets: self._retrieveToolOffsets(),
+                invertAxes: self._retrieveAxesConfiguration()
             });
             self.synchronizeOptions();
             self.enabled = true;
@@ -186,7 +254,7 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
             step: 1,
             value: 0,
             enabled: false,
-            formatter: function(value) { return "Layer #" + value; }
+            formatter: function(value) { return "Layer #" + (value + 1); }
         }).on("slide", self.changeLayer);
     };
 
@@ -322,17 +390,9 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
             self.currentLayer = 0;
         } else {
             var output = [];
-            output.push("Model size is: " + model.width.toFixed(2) + "mm &times; " + model.depth.toFixed(2) + "mm &times; " + model.height.toFixed(2) + "mm");
-            if (model.filament.length == 0) {
-                output.push("Total filament used: " + model.filament.toFixed(2) + "mm");
-            } else {
-                for (var i = 0; i < model.filament.length; i++) {
-                    output.push("Total filament used (Tool " + i + "): " + model.filament[i].toFixed(2) + "mm");
-                }
-            }
-            output.push("Estimated print time: " + formatDuration(model.printTime));
-            output.push("Estimated layer height: " + model.layerHeight.toFixed(2) + "mm");
-            output.push("Layer count: " + model.layersPrinted.toFixed(0) + " printed, " + model.layersTotal.toFixed(0) + " visited");
+            output.push(gettext("Model size") + ": " + model.width.toFixed(2) + "mm &times; " + model.depth.toFixed(2) + "mm &times; " + model.height.toFixed(2) + "mm");
+            output.push(gettext("Estimated layer height") + ": " + model.layerHeight.toFixed(2) + gettext("mm"));
+            output.push(gettext("Layer count") + ": " + model.layersPrinted.toFixed(0) + " " + gettext("printed") + ", " + model.layersTotal.toFixed(0) + " " + gettext("visited"));
 
             self.ui_modelInfo(output.join("<br>"));
 
@@ -351,17 +411,19 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
             self.currentCommand = [0, 1];
         } else {
             var output = [];
-            output.push("Layer number: " + layer.number);
-            output.push("Layer height (mm): " + layer.height);
-            output.push("GCODE commands in layer: " + layer.commands);
-            if (layer.filament.length == 1) {
-                output.push("Filament used by layer: " + layer.filament[0].toFixed(2) + "mm");
-            } else {
-                for (var i = 0; i < layer.filament.length; i++) {
-                    output.push("Filament used by layer (Tool " + i + "): " + layer.filament[i].toFixed(2) + "mm");
+            output.push(gettext("Layer number") + ": " + (layer.number + 1));
+            output.push(gettext("Layer height") + " (mm): " + layer.height);
+            output.push(gettext("GCODE commands in layer") + ": " + layer.commands);
+            if (layer.filament != undefined) {
+                if (layer.filament.length == 1) {
+                    output.push(gettext("Filament used by layer") + ": " + layer.filament[0].toFixed(2) + "mm");
+                } else {
+                    for (var i = 0; i < layer.filament.length; i++) {
+                        output.push(gettext("Filament used by layer") + " (" + gettext("Tool") + " " + i + "): " + layer.filament[i].toFixed(2) + "mm");
+                    }
                 }
             }
-            output.push("Print time for layer: " + formatDuration(layer.printTime));
+            output.push(gettext("Print time for layer") + ": " + formatDuration(layer.printTime));
 
             self.ui_layerInfo(output.join("<br>"));
 
@@ -404,5 +466,9 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
 
         GCODE.ui.changeSelectedCommands(self.layerSlider.slider("getValue"), tuple[0], tuple[1]);
     };
+
+    self.onDataUpdaterReconnect = function() {
+        self.reset();
+    }
 
 }

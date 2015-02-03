@@ -16,16 +16,13 @@ Get connection settings
    Retrieve the current connection settings, including information regarding the available baudrates and
    serial ports and the current connection state.
 
-   **Example Request**
+   **Example**
 
    .. sourcecode:: http
 
       GET /api/connection HTTP/1.1
       Host: example.com
-      Content-Type: application/json
       X-Api-Key: abcdef...
-
-   **Example Response**
 
    .. sourcecode:: http
 
@@ -36,13 +33,16 @@ Get connection settings
         "current": {
           "state": "Operational",
           "port": "/dev/ttyACM0",
-          "baudrate": 250000
+          "baudrate": 250000,
+          "printerProfile": "_default"
         },
         "options": {
           "ports": ["/dev/ttyACM0", "VIRTUAL"],
           "baudrates": [250000, 230400, 115200, 57600, 38400, 19200, 9600],
+          "printerProfiles": [{"name": "Default", id: "_default"}],
           "portPreference": "/dev/ttyACM0",
           "baudratePreference": 250000,
+          "printerProfilePreference": "_default",
           "autoconnect": true
         }
       }
@@ -65,6 +65,8 @@ Issue a connection command
        no preference is available auto detection will be attempted.
      * ``baudrate``: Optional, specific baudrate to connect with. If not set the current ``baudratePreference`` will
        be used, or if no preference is available auto detection will be attempted.
+     * ``printerProfile`` Optional, specific printer profile to use for connection. If not set the current default printer
+       profile will be used.
      * ``save``: Optional, whether to save the request's ``port`` and ``baudrate`` settings as new preferences. Defaults
        to ``false`` if not set.
      * ``autoconnect``: Optional, whether to automatically connect to the printer on OctoPrint's startup in the future.
@@ -86,9 +88,14 @@ Issue a connection command
         "command": "connect",
         "port": "/dev/ttyACM0",
         "baudrate": 115200,
+        "printerProfile": "my_printer_profile",
         "save": true,
         "autoconnect": true
       }
+
+   .. sourcecode:: http
+
+      HTTP/1.1 204 No Content
 
    **Example Disconnect Request**
 
@@ -103,6 +110,10 @@ Issue a connection command
         "command": "disconnect"
       }
 
+   .. sourcecode:: http
+
+      HTTP/1.1 204 No Content
+
    :json string command:      The command to issue, either ``connect`` or ``disconnect``
    :json string port:         ``connect`` command: The port to connect to. If left out either the existing ``portPreference``
                               will be used, or if that is not available OctoPrint will attempt auto detection. Must be part
@@ -110,6 +121,8 @@ Issue a connection command
    :json number baudrate:     ``connect`` command: The baudrate to connect with. If left out either the existing
                               ``baudratePreference`` will be used, or if that is not available OctoPrint will attempt
                               autodetection. Must be part of the available baudrates.
+   :json string printerProfile: ``connect`` command: The id of the printer profile to use for the connection. If left out the current
+                                default printer profile will be used. Must be part of the available printer profiles.
    :json boolean save:        ``connect`` command: Whether to save the supplied connection settings as the new preference.
                               Defaults to ``false`` if not set.
    :json boolean autoconnect: ``connect`` command: Whether to attempt to automatically connect to the printer on server
