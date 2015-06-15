@@ -55,6 +55,9 @@ class gcode(object):
 		scale = 1.0
 		posAbs = True
 		feedRateXY = min(printer_profile["axes"]["x"]["speed"], printer_profile["axes"]["y"]["speed"])
+		if feedRateXY == 0:
+			# some somewhat sane default if axes speeds are insane...
+			feedRateXY = 2000
 		offsets = printer_profile["extruder"]["offsets"]
 
 		for line in gcodeFile:
@@ -128,7 +131,7 @@ class gcode(object):
 							pos[1] += y * scale
 						if z is not None:
 							pos[2] += z * scale
-					if f is not None:
+					if f is not None and f != 0:
 						feedRateXY = f
 
 					moveType = 'move'
@@ -262,13 +265,16 @@ def getCodeInt(line, code):
 
 
 def getCodeFloat(line, code):
+	import math
 	n = line.find(code) + 1
 	if n < 1:
 		return None
 	m = line.find(' ', n)
 	try:
 		if m < 0:
-			return float(line[n:])
-		return float(line[n:m])
+			val = float(line[n:])
+		else:
+			val = float(line[n:m])
+		return val if not (math.isnan(val) or math.isinf(val)) else None
 	except:
 		return None

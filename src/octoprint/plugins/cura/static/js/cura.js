@@ -71,6 +71,7 @@ $(function() {
                 self.placeholderDisplayName(name);
                 self.placeholderDescription("Imported from " + self.fileName() + " on " + formatDate(new Date().getTime() / 1000));
 
+                self.uploadButton.unbind("click");
                 self.uploadButton.on("click", function() {
                     var form = {
                         allowOverwrite: self.profileAllowOverwrite()
@@ -183,9 +184,12 @@ $(function() {
             self.settings = self.settingsViewModel.settings;
             self.requestData();
         };
-
     }
 
     // view model class, parameters for constructor, container to bind to
-    ADDITIONAL_VIEWMODELS.push([CuraViewModel, ["loginStateViewModel", "settingsViewModel", "slicingViewModel"], document.getElementById("settings_plugin_cura")]);
+    OCTOPRINT_VIEWMODELS.push([
+        CuraViewModel,
+        ["loginStateViewModel", "settingsViewModel", "slicingViewModel"],
+        "#settings_plugin_cura"
+    ]);
 });

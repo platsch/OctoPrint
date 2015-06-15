@@ -39,52 +39,41 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 
 	def on_startup(self, host, port):
 		# setup our custom logger
-		cura_logging_handler = logging.handlers.RotatingFileHandler(self._settings.getPluginLogfilePath(postfix="engine"), maxBytes=2*1024*1024)
+		cura_logging_handler = logging.handlers.RotatingFileHandler(self._settings.get_plugin_logfile_path(postfix="engine"), maxBytes=2*1024*1024)
 		cura_logging_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 		cura_logging_handler.setLevel(logging.DEBUG)
 
 		self._cura_logger.addHandler(cura_logging_handler)
-		self._cura_logger.setLevel(logging.DEBUG if self._settings.getBoolean(["debug_logging"]) else logging.CRITICAL)
+		self._cura_logger.setLevel(logging.DEBUG if self._settings.get_boolean(["debug_logging"]) else logging.CRITICAL)
 		self._cura_logger.propagate = False
 
 	##~~ BlueprintPlugin API
 
 	@octoprint.plugin.BlueprintPlugin.route("/import", methods=["POST"])
-	def importCuraProfile(self):
+	def import_cura_profile(self):
 		import datetime
 		import tempfile
 
 		from octoprint.server import slicingManager
 
 		input_name = "file"
-		input_upload_name = input_name + "." + self._settings.globalGet(["server", "uploads", "nameSuffix"])
-		input_upload_path = input_name + "." + self._settings.globalGet(["server", "uploads", "pathSuffix"])
+		input_upload_name = input_name + "." + self._settings.global_get(["server", "uploads", "nameSuffix"])
+		input_upload_path = input_name + "." + self._settings.global_get(["server", "uploads", "pathSuffix"])
 
 		if input_upload_name in flask.request.values and input_upload_path in flask.request.values:
 			filename = flask.request.values[input_upload_name]
 			try:
 				profile_dict = Profile.from_cura_ini(flask.request.values[input_upload_path])
 			except Exception as e:
-				return flask.make_response("Something went wrong while converting imported profile: {message}".format(e.message), 500)
-
-		elif input_name in flask.request.files:
-			temp_file = tempfile.NamedTemporaryFile("wb", delete=False)
-			try:
-				temp_file.close()
-				upload = flask.request.files[input_name]
-				upload.save(temp_file.name)
-				profile_dict = Profile.from_cura_ini(temp_file.name)
-			except Exception as e:
-				return flask.make_response("Something went wrong while converting imported profile: {message}".format(e.message), 500)
-			finally:
-				os.remove(temp_file)
-
-			filename = upload.filename
+				self._logger.exception("Error while converting the imported profile")
+				return flask.make_response("Something went wrong while converting imported profile: {message}".format(message=str(e)), 500)
 
 		else:
+			self._logger.warn("No profile file included for importing, aborting")
 			return flask.make_response("No file included", 400)
 
 		if profile_dict is None:
+			self._logger.warn("Could not convert profile, aborting")
 			return flask.make_response("Could not convert Cura profile", 400)
 
 		name, _ = os.path.splitext(filename)
@@ -92,7 +81,7 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 		# default values for name, display name and description
 		profile_name = _sanitize_name(name)
 		profile_display_name = name
-		profile_description = "Imported from {filename} on {date}".format(filename=filename, date=octoprint.util.getFormattedDateTime(datetime.datetime.now()))
+		profile_description = "Imported from {filename} on {date}".format(filename=filename, date=octoprint.util.get_formatted_datetime(datetime.datetime.now()))
 		profile_allow_overwrite = False
 
 		# overrides
@@ -106,12 +95,16 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 			from octoprint.server.api import valid_boolean_trues
 			profile_allow_overwrite = flask.request.values["allowOverwrite"] in valid_boolean_trues
 
-		slicingManager.save_profile("cura",
-		                            profile_name,
-		                            profile_dict,
-		                            allow_overwrite=profile_allow_overwrite,
-		                            display_name=profile_display_name,
-		                            description=profile_description)
+		try:
+			slicingManager.save_profile("cura",
+			                            profile_name,
+			                            profile_dict,
+			                            allow_overwrite=profile_allow_overwrite,
+			                            display_name=profile_display_name,
+			                            description=profile_description)
+		except octoprint.slicing.ProfileAlreadyExists:
+			self._logger.warn("Profile {profile_name} already exists, aborting".format(**locals()))
+			return flask.make_response("A profile named {profile_name} already exists for slicer cura".format(**locals()), 409)
 
 		result = dict(
 			resource=flask.url_for("api.slicingGetSlicerProfile", slicer="cura", name=profile_name, _external=True),
@@ -134,11 +127,11 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 	##~~ SettingsPlugin API
 
 	def on_settings_save(self, data):
-		old_debug_logging = self._settings.getBoolean(["debug_logging"])
+		old_debug_logging = self._settings.get_boolean(["debug_logging"])
 
 		super(CuraPlugin, self).on_settings_save(data)
 
-		new_debug_logging = self._settings.getBoolean(["debug_logging"])
+		new_debug_logging = self._settings.get_boolean(["debug_logging"])
 		if old_debug_logging != new_debug_logging:
 			if new_debug_logging:
 				self._cura_logger.setLevel(logging.DEBUG)
@@ -191,6 +184,9 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 		return octoprint.slicing.SlicingProfile(properties["type"], "unknown", profile_dict, display_name=display_name, description=description)
 
 	def save_slicer_profile(self, path, profile, allow_overwrite=True, overrides=None):
+		if os.path.exists(path) and not allow_overwrite:
+			raise octoprint.slicing.ProfileAlreadyExists("cura", profile.name)
+
 		new_profile = Profile.merge_profile(profile.data, overrides=overrides)
 
 		if profile.display_name is not None:
@@ -241,6 +237,7 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 				self._logger.info("Running %r in %s" % (command, working_dir))
 
 				p = sarge.run(command, cwd=working_dir, async=True, stdout=sarge.Capture(), stderr=sarge.Capture())
+				p.wait_events()
 				self._slicing_commands[machinecode_path] = p.commands[0]
 
 			try:
@@ -387,9 +384,6 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 		return profile_dict
 
 	def _save_profile(self, path, profile, allow_overwrite=True):
-		if not allow_overwrite and os.path.exists(path):
-			raise IOError("Cannot overwrite {path}".format(path=path))
-
 		import yaml
 		with open(path, "wb") as f:
 			yaml.safe_dump(profile, f, default_flow_style=False, indent="  ", allow_unicode=True)
@@ -412,9 +406,8 @@ def _sanitize_name(name):
 	return sanitized_name.lower()
 
 __plugin_name__ = "CuraEngine"
-__plugin_version__ = "0.1"
 __plugin_author__ = "Gina Häußge"
 __plugin_url__ = "https://github.com/foosel/OctoPrint/wiki/Plugin:-Cura"
 __plugin_description__ = "Adds support for slicing via CuraEngine from within OctoPrint"
 __plugin_license__ = "AGPLv3"
-__plugin_implementations__ = [CuraPlugin()]
+__plugin_implementation__ = CuraPlugin()

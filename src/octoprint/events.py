@@ -69,6 +69,7 @@ class Events(object):
 	CONVEYOR = "Conveyor"
 	EJECT = "Eject"
 	E_STOP = "EStop"
+	REGISTERED_MESSAGE_RECEIVED = "RegisteredMessageReceived"
 
 	# Timelapse
 	CAPTURE_START = "CaptureStart"
@@ -304,7 +305,7 @@ class CommandTrigger(GenericEventListener):
 			else:
 				commandExecutioner(command)
 		except subprocess.CalledProcessError, e:
-			self._logger.warn("Command failed with return code %i: %s" % (e.returncode, e.message))
+			self._logger.warn("Command failed with return code %i: %s" % (e.returncode, str(e)))
 		except Exception, ex:
 			self._logger.exception("Command failed")
 
@@ -340,7 +341,7 @@ class CommandTrigger(GenericEventListener):
 			"__now": datetime.datetime.now().isoformat()
 		}
 
-		currentData = self._printer.getCurrentData()
+		currentData = self._printer.get_current_data()
 
 		if "currentZ" in currentData.keys() and currentData["currentZ"] is not None:
 			params["__currentZ"] = str(currentData["currentZ"])
