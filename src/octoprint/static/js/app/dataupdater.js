@@ -9,11 +9,22 @@ function DataUpdater(allViewModels) {
     self._autoReconnectTimeouts = [0, 1, 1, 2, 3, 5, 8, 13, 20, 40, 100];
     self._autoReconnectDialogIndex = 1;
 
-    self.connect = function() {
+    self._pluginHash = undefined;
+
+    self._throttleFactor = 1;
+    self._baseProcessingLimit = 500.0;
+    self._lastProcessingTimes = [];
+    self._lastProcessingTimesSize = 20;
+
+    self._connectCallback = undefined;
+
+    self.connect = function(callback) {
         var options = {};
         if (SOCKJS_DEBUG) {
             options["debug"] = true;
         }
+
+        self._connectCallback = callback;
 
         self._socket = new SockJS(SOCKJS_URI, undefined, options);
         self._socket.onopen = self._onconnect;
@@ -25,6 +36,30 @@ function DataUpdater(allViewModels) {
         self._socket.close();
         delete self._socket;
         self.connect();
+    };
+
+    self.increaseThrottle = function() {
+        self.setThrottle(self._throttleFactor + 1);
+    };
+
+    self.decreaseThrottle = function() {
+        if (self._throttleFactor <= 1) {
+            return;
+        }
+        self.setThrottle(self._throttleFactor - 1);
+    };
+
+    self.setThrottle = function(throttle) {
+        self._throttleFactor = throttle;
+
+        self._send("throttle", self._throttleFactor);
+        log.debug("DataUpdater: New SockJS throttle factor:", self._throttleFactor, " new processing limit:", self._baseProcessingLimit * self._throttleFactor);
+    };
+
+    self._send = function(message, data) {
+        var payload = {};
+        payload[message] = data;
+        self._socket.send(JSON.stringify(payload));
     };
 
     self._onconnect = function() {
@@ -46,7 +81,8 @@ function DataUpdater(allViewModels) {
                 }
 
                 if (viewModel.hasOwnProperty("onServerDisconnect")) {
-                    if (!viewModel.onServerDisconnect()) {
+                    var result = viewModel.onServerDisconnect();
+                    if (result !== undefined && !result) {
                         handled = true;
                     }
                 }
@@ -81,7 +117,8 @@ function DataUpdater(allViewModels) {
             }
 
             if (viewModel.hasOwnProperty("onServerDisconnect")) {
-                if (!viewModel.onServerDisconnect()) {
+                var result = viewModel.onServerDisconnect();
+                if (result !== undefined && !result) {
                     handled = true;
                 }
             }
@@ -106,6 +143,7 @@ function DataUpdater(allViewModels) {
             var gcodeUploadProgress = $("#gcode_upload_progress");
             var gcodeUploadProgressBar = $(".bar", gcodeUploadProgress);
 
+            var start = new Date().getTime();
             switch (prop) {
                 case "connected": {
                     // update the current UI API key and send it with any request
@@ -117,12 +155,18 @@ function DataUpdater(allViewModels) {
                     var oldVersion = VERSION;
                     VERSION = data["version"];
                     DISPLAY_VERSION = data["display_version"];
+                    BRANCH = data["branch"];
                     $("span.version").text(DISPLAY_VERSION);
+
+                    var oldPluginHash = self._pluginHash;
+                    self._pluginHash = data["plugin_hash"];
 
                     if ($("#offline_overlay").is(":visible")) {
                         hideOfflineOverlay();
                         _.each(self.allViewModels, function(viewModel) {
-                            if (viewModel.hasOwnProperty("onDataUpdaterReconnect")) {
+                            if (viewModel.hasOwnProperty("onServerReconnect")) {
+                                viewModel.onServerReconnect();
+                            } else if (viewModel.hasOwnProperty("onDataUpdaterReconnect")) {
                                 viewModel.onDataUpdaterReconnect();
                             }
                         });
@@ -130,15 +174,25 @@ function DataUpdater(allViewModels) {
                         if ($('#tabs li[class="active"] a').attr("href") == "#control") {
                             $("#webcam_image").attr("src", CONFIG_WEBCAM_STREAM + "?" + new Date().getTime());
                         }
+                    } else {
+                        _.each(self.allViewModels, function(viewModel) {
+                            if (viewModel.hasOwnProperty("onServerConnect")) {
+                                viewModel.onServerConnect();
+                            }
+                        });
                     }
 
-                    if (oldVersion != VERSION) {
-                        // version change detected, force reloading UI - use randomized delay to reduce server load in
-                        // the case of multiple clients
-                        var delay = 5 + Math.floor(Math.random() * 5) + 1;
-                        setTimeout(function() {location.reload(true);}, delay * 1000);
+                    if (oldVersion != VERSION || (oldPluginHash != undefined && oldPluginHash != self._pluginHash)) {
+                        showReloadOverlay();
+                    }
 
-                        // TODO notify about that, or show confirmation
+                    self.setThrottle(1);
+
+                    log.info("Connected to the server");
+
+                    if (self._connectCallback) {
+                        self._connectCallback();
+                        self._connectCallback = undefined;
                     }
 
                     break;
@@ -176,15 +230,7 @@ function DataUpdater(allViewModels) {
 
                     log.debug("Got event " + type + " with payload: " + JSON.stringify(payload));
 
-                    if (type == "MovieRendering") {
-                        new PNotify({title: gettext("Rendering timelapse"), text: _.sprintf(gettext("Now rendering timelapse %(movie_basename)s"), payload)});
-                    } else if (type == "MovieDone") {
-                        new PNotify({title: gettext("Timelapse ready"), text: _.sprintf(gettext("New timelapse %(movie_basename)s is done rendering."), payload)});
-                    } else if (type == "MovieFailed") {
-                        html = "<p>" + _.sprintf(gettext("Rendering of timelapse %(movie_basename)s failed with return code %(returncode)s"), payload) + "</p>";
-                        html += pnotifyAdditionalInfo('<pre style="overflow: auto">' + payload.error + '</pre>');
-                        new PNotify({title: gettext("Rendering failed"), text: html, type: "error", hide: false});
-                    } else if (type == "SlicingStarted") {
+                    if (type == "SlicingStarted") {
                         gcodeUploadProgress.addClass("progress-striped").addClass("active");
                         gcodeUploadProgressBar.css("width", "100%");
                         if (payload.progressAvailable) {
@@ -221,7 +267,22 @@ function DataUpdater(allViewModels) {
                             text: _.sprintf(gettext("Streamed %(local)s to %(remote)s on SD, took %(time).2f seconds"), payload),
                             type: "success"
                         });
-                        gcodeFilesViewModel.requestData(payload.remote, "sdcard");
+                    } else if (type == "PrintCancelled") {
+                        if (payload.firmwareError) {
+                            new PNotify({
+                                title: gettext("Unhandled communication error"),
+                                text: _.sprintf(gettext("There was an unhandled error while talking to the printer. Due to that the ongoing print job was cancelled. Error: %(firmwareError)s"), payload),
+                                type: "error",
+                                hide: false
+                            });
+                        }
+                    } else if (type == "Error") {
+                        new PNotify({
+                                title: gettext("Unhandled communication error"),
+                                text: _.sprintf(gettext("The was an unhandled error while talking to the printer. Due to that OctoPrint disconnected. Error: %(error)s"), payload),
+                                type: "error",
+                                hide: false
+                        });
                     }
 
                     var legacyEventHandlers = {
@@ -261,8 +322,27 @@ function DataUpdater(allViewModels) {
                     })
                 }
             }
+
+            var end = new Date().getTime();
+            var difference = end - start;
+
+            while (self._lastProcessingTimes.length >= self._lastProcessingTimesSize) {
+                self._lastProcessingTimes.shift();
+            }
+            self._lastProcessingTimes.push(difference);
+
+            var processingLimit = self._throttleFactor * self._baseProcessingLimit;
+            if (difference > processingLimit) {
+                self.increaseThrottle();
+                log.debug("We are slow (" + difference + " > " + processingLimit + "), reducing refresh rate");
+            } else if (self._throttleFactor > 1) {
+                var maxProcessingTime = Math.max.apply(null, self._lastProcessingTimes);
+                var lowerProcessingLimit = (self._throttleFactor - 1) * self._baseProcessingLimit;
+                if (maxProcessingTime < lowerProcessingLimit) {
+                    self.decreaseThrottle();
+                    log.debug("We are fast (" + maxProcessingTime + " < " + lowerProcessingLimit + "), increasing refresh rate");
+                }
+            }
         }
     };
-
-    self.connect();
 }

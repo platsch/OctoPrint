@@ -69,9 +69,32 @@ class OctoPrintPlugin(Plugin):
 
 	   The :class:`~octoprint.server.LifecycleManager` instance. Injected by the plugin core system upon initialization
 	   of the implementation.
+
+	.. attribute:: _data_folder
+
+	   Path to the data folder for the plugin to use for any data it might have to persist. Should always be accessed
+	   through :meth:`get_plugin_data_folder` since that function will also ensure that the data folder actually exists
+	   and if not creating it before returning it. Injected by the plugin core system upon initialization of the
+	   implementation.
+
+    .. automethod:: get_plugin_data_folder
 	"""
 
-	pass
+	def get_plugin_data_folder(self):
+		"""
+		Retrieves the path to a data folder specifically for the plugin, ensuring it exists and if not creating it
+		before returning it.
+
+		Plugins may use this folder for storing additional data they need for their operation.
+		"""
+		if self._data_folder is None:
+			raise RuntimeError("self._plugin_data_folder is None, has the plugin been initialized yet?")
+
+		import os
+		if not os.path.isdir(self._data_folder):
+			os.makedirs(self._data_folder)
+		return self._data_folder
+
 
 class ReloadNeedingPlugin(Plugin):
 	pass
@@ -628,6 +651,24 @@ class BlueprintPlugin(OctoPrintPlugin, RestartNeedingPlugin):
 			return f
 		return decorator
 
+	@staticmethod
+	def errorhandler(code_or_exception):
+		"""
+		A decorator to mark errorhandlings methods in your BlueprintPlugin subclass. Works just the same as Flask's
+		own ``errorhandler`` decorator available on blueprints.
+
+		See `the documentation for flask.Blueprint.errorhandler <http://flask.pocoo.org/docs/0.10/api/#flask.Blueprint.errorhandler>`_
+		and `the documentation for flask.Flask.errorhandler <http://flask.pocoo.org/docs/0.10/api/#flask.Flask.errorhandler>`_ for more
+		information.
+		"""
+		from collections import defaultdict
+		def decorator(f):
+			if not hasattr(f, "_blueprint_error_handler") or f._blueprint_error_handler is None:
+				f._blueprint_error_handler = defaultdict(list)
+			f._blueprint_error_handler[f.__name__].append(code_or_exception)
+			return f
+		return decorator
+
 	def get_blueprint(self):
 		"""
 		Creates and returns the blueprint for your plugin. Override this if you want to define and handle your blueprint yourself.
@@ -637,15 +678,34 @@ class BlueprintPlugin(OctoPrintPlugin, RestartNeedingPlugin):
 		:return: the blueprint ready to be registered with Flask
 		"""
 
+		if hasattr(self, "_blueprint"):
+			# if we already constructed the blueprint and hence have it cached,
+			# return that instance - we don't want to instance it multiple times
+			return self._blueprint
+
 		import flask
 		kwargs = self.get_blueprint_kwargs()
 		blueprint = flask.Blueprint("plugin." + self._identifier, self._identifier, **kwargs)
+
+		# we now iterate over all members of ourselves and look if we find an attribute
+		# that has data originating from one of our decorators - we ignore anything
+		# starting with a _ to only handle public stuff
 		for member in [member for member in dir(self) if not member.startswith("_")]:
 			f = getattr(self, member)
+
 			if hasattr(f, "_blueprint_rules") and member in f._blueprint_rules:
+				# this attribute was annotated with our @route decorator
 				for blueprint_rule in f._blueprint_rules[member]:
 					rule, options = blueprint_rule
 					blueprint.add_url_rule(rule, options.pop("endpoint", f.__name__), view_func=f, **options)
+
+			if hasattr(f, "_blueprint_error_handler") and member in f._blueprint_error_handler:
+				# this attribute was annotated with our @error_handler decorator
+				for code_or_exception in f._blueprint_error_handler[member]:
+					blueprint.errorhandler(code_or_exception)(f)
+
+		# cache and return the blueprint object
+		self._blueprint = blueprint
 		return blueprint
 
 	def get_blueprint_kwargs(self):
@@ -718,7 +778,7 @@ class SettingsPlugin(OctoPrintPlugin):
 	       def on_settings_save(self, data):
 	           old_flag = self._settings.get_boolean(["sub", "some_flag"])
 
-	           super(MySettingsPlugin, self).on_settings_save(data)
+	           octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 
 	           new_flag = self._settings.get_boolean(["sub", "some_flag"])
 	           if old_flag != new_flag:
@@ -741,6 +801,9 @@ class SettingsPlugin(OctoPrintPlugin):
 	   the plugin core system upon initialization of the implementation.
 	"""
 
+	config_version_key = "_config_version"
+	"""Key of the field in the settings that holds the configuration format version."""
+
 	def on_settings_load(self):
 		"""
 		Loads the settings for the plugin, called by the Settings API view in order to retrieve all settings from
@@ -758,7 +821,10 @@ class SettingsPlugin(OctoPrintPlugin):
 
 		:return: the current settings of the plugin, as a dictionary
 		"""
-		return self._settings.get([], asdict=True, merged=True)
+		data = self._settings.get_all_data()
+		if self.config_version_key in data:
+			del data[self.config_version_key]
+		return data
 
 	def on_settings_save(self, data):
 		"""
@@ -769,7 +835,8 @@ class SettingsPlugin(OctoPrintPlugin):
 		.. note::
 
 		   The default implementation will persist your plugin's settings as is, so just in the structure and in the
-		   types that were received by the Settings API view.
+		   types that were received by the Settings API view. Values identical to the default settings values
+		   will *not* be persisted.
 
 		   If you need more granular control here, e.g. over the used data types, you'll need to override this method
 		   and iterate yourself over all your settings, retrieving them (if set) from the supplied received ``data``
@@ -777,12 +844,38 @@ class SettingsPlugin(OctoPrintPlugin):
 
 		Arguments:
 		    data (dict): The settings dictionary to be saved for the plugin
+
+		Returns:
+		    dict: The settings that differed from the defaults and were actually saved.
 		"""
 		import octoprint.util
 
-		current = self._settings.get([], asdict=True, merged=True)
-		data = octoprint.util.dict_merge(current, data)
-		self._settings.set([], data)
+		# get the current data
+		current = self._settings.get_all_data()
+		if current is None:
+			current = dict()
+
+		# merge our new data on top of it
+		new_current = octoprint.util.dict_merge(current, data)
+		if self.config_version_key in new_current:
+			del new_current[self.config_version_key]
+
+		# determine diff dict that contains minimal set of changes against the
+		# default settings - we only want to persist that, not everything
+		diff = octoprint.util.dict_minimal_mergediff(self.get_settings_defaults(), new_current)
+
+		version = self.get_settings_version()
+
+		to_persist = dict(diff)
+		if version:
+			to_persist[self.config_version_key] = version
+
+		if to_persist:
+			self._settings.set([], to_persist)
+		else:
+			self._settings.clean_all_data()
+
+		return diff
 
 	def get_settings_defaults(self):
 		"""
@@ -829,6 +922,93 @@ class SettingsPlugin(OctoPrintPlugin):
 		        getters, the second the preprocessors for setters
 		"""
 		return dict(), dict()
+
+	def get_settings_version(self):
+		"""
+		Retrieves the settings format version of the plugin.
+
+		Use this to have OctoPrint trigger your migration function if it detects an outdated settings version in
+		config.yaml.
+
+		Returns:
+		    int or None: an int signifying the current settings format, should be incremented by plugins whenever there
+		                 are backwards incompatible changes. Returning None here disables the version tracking for the
+		                 plugin's configuration.
+		"""
+		return None
+
+	def on_settings_migrate(self, target, current):
+		"""
+		Called by OctoPrint if it detects that the installed version of the plugin necessitates a higher settings version
+		than the one currently stored in _config.yaml. Will also be called if the settings data stored in config.yaml
+		doesn't have version information, in which case the ``current`` parameter will be None.
+
+		Your plugin's implementation should take care of migrating any data by utilizing self._settings. OctoPrint
+		will take care of saving any changes to disk by calling `self._settings.save()` after returning from this method.
+
+		This method will be called before your plugin's :func:`on_settings_initialized` method, with all injections already
+		having taken place. You can therefore depend on the configuration having been migrated by the time
+		:func:`on_settings_initialized` is called.
+
+		Arguments:
+		    target (int): The settings format version the plugin requires, this should always be the same value as
+		                  returned by :func:`get_settings_version`.
+		    current (int or None): The settings format version as currently stored in config.yaml. May be None if
+		                  no version information can be found.
+		"""
+		pass
+
+	def on_settings_cleanup(self):
+		"""
+		Called after migration and initialization but before call to :func:`on_settings_initialized`.
+
+		Plugins may overwrite this method to perform additional clean up tasks.
+
+		The default implementation just minimizes the data persisted on disk to only contain
+		the differences to the defaults (in case the current data was persisted with an older
+		version of OctoPrint that still duplicated default data).
+		"""
+		import octoprint.util
+		from octoprint.settings import NoSuchSettingsPath
+
+		try:
+			# let's fetch the current persisted config (so only the data on disk,
+			# without the defaults)
+			config = self._settings.get_all_data(merged=False, incl_defaults=False, error_on_path=True)
+		except NoSuchSettingsPath:
+			# no config persisted, nothing to do => get out of here
+			return
+
+		if config is None:
+			# config is set to None, that doesn't make sense, kill it and leave
+			self._settings.clean_all_data()
+			return
+
+		if self.config_version_key in config and config[self.config_version_key] is None:
+			# delete None entries for config version - it's the default, no need
+			del config[self.config_version_key]
+
+		# calculate a minimal diff between the settings and the current config -
+		# anything already in the settings will be removed from the persisted
+		# config, no need to duplicate it
+		defaults = self.get_settings_defaults()
+		diff = octoprint.util.dict_minimal_mergediff(defaults, config)
+
+		if not diff:
+			# no diff to defaults, no need to have anything persisted
+			self._settings.clean_all_data()
+		else:
+			# diff => persist only that
+			self._settings.set([], diff)
+
+	def on_settings_initialized(self):
+		"""
+		Called after the settings have been initialized and - if necessary - also been migrated through a call to
+		func:`on_settings_migrate`.
+
+		This method will always be called after the `initialize` method.
+		"""
+		pass
 
 
 class EventHandlerPlugin(OctoPrintPlugin):

@@ -13,6 +13,8 @@ import tempfile
 
 import octoprint.filemanager
 
+from octoprint.util import is_hidden_path
+
 class StorageInterface(object):
 	"""
 	Interface of storage adapters for OctoPrint.
@@ -309,6 +311,45 @@ class LocalFileStorage(StorageInterface):
 
 		self._metadata_cache = pylru.lrucache(10)
 
+		from slugify import Slugify
+		self._slugify = Slugify()
+		self._slugify.safe_chars = "-_.() "
+
+		self._old_metadata = None
+		self._initialize_metadata()
+
+	def _initialize_metadata(self):
+		self._logger.info("Initializing the file metadata for {}...".format(self.basefolder))
+
+		old_metadata_path = os.path.join(self.basefolder, "metadata.yaml")
+		backup_path = os.path.join(self.basefolder, "metadata.yaml.backup")
+
+		if os.path.exists(old_metadata_path):
+			# load the old metadata file
+			try:
+				with open(old_metadata_path) as f:
+					import yaml
+					self._old_metadata = yaml.safe_load(f)
+			except:
+				self._logger.exception("Error while loading old metadata file")
+
+			# make sure the metadata is initialized as far as possible
+			self._list_folder(self.basefolder)
+
+			# rename the old metadata file
+			self._old_metadata = None
+			try:
+				import shutil
+				shutil.move(old_metadata_path, backup_path)
+			except:
+				self._logger.exception("Could not rename old metadata.yaml file")
+
+		else:
+			# make sure the metadata is initialized as far as possible
+			self._list_folder(self.basefolder)
+
+		self._logger.info("... file metadata for {} initialized successfully.".format(self.basefolder))
+
 	@property
 	def analysis_backlog(self):
 		for entry in self._analysis_backlog_generator():
@@ -322,7 +363,7 @@ class LocalFileStorage(StorageInterface):
 		if not metadata:
 			metadata = dict()
 		for entry in os.listdir(path):
-			if entry.startswith(".") or not octoprint.filemanager.valid_file_type(entry):
+			if is_hidden_path(entry) or not octoprint.filemanager.valid_file_type(entry):
 				continue
 
 			absolute_path = os.path.join(path, entry)
@@ -419,6 +460,9 @@ class LocalFileStorage(StorageInterface):
 			links.append(("printerprofile", dict(id=printer_profile["id"], name=printer_profile["name"])))
 
 		self._add_links(name, path, links)
+
+		# touch the file to set last access and modification time to now
+		os.utime(file_path, None)
 
 		return self.path_in_storage((path, name))
 
@@ -546,24 +590,6 @@ class LocalFileStorage(StorageInterface):
 		Note that for a ``path`` without a trailing slash the last part will be considered a file name and
 		hence be returned at second position. If you only need to convert a folder path, be sure to
 		include a trailing slash for a string ``path`` or an empty last element for a list ``path``.
-
-		Examples::
-
-		    >>> storage = LocalFileStorage("/some/base/folder")
-		    >>> storage.sanitize("some/folder/and/some file.gco")
-		    ("/some/base/folder/some/folder/and", "some_file.gco")
-		    >>> storage.sanitize(("some", "folder", "and", "some file.gco"))
-		    ("/some/base/folder/some/folder/and", "some_file.gco")
-		    >>> storage.sanitize("some file.gco")
-		    ("/some/base/folder", "some_file.gco")
-		    >>> storage.sanitize(("some file.gco",))
-		    ("/some/base/folder", "some_file.gco")
-		    >>> storage.sanitize("")
-		    ("/some/base/folder", "")
-		    >>> storage.sanitize("some/folder/with/trailing/slash/")
-		    ("/some/base/folder/some/folder/with/trailing/slash", "")
-		    >>> storage.sanitize("some", "folder", "")
-		    ("/some/base/folder/some/folder", "")
 		"""
 		name = None
 		if isinstance(path, (str, unicode, basestring)):
@@ -587,27 +613,9 @@ class LocalFileStorage(StorageInterface):
 
 	def sanitize_name(self, name):
 		"""
-		Raises a :class:`ValueError` for a ``name`` containing ``/`` or ``\``. Otherwise strips any characters from the
-		given ``name`` that are not any of the ASCII characters, digits, ``-``, ``_``, ``.``, ``(``, ``)`` or space and
-		replaces and spaces with ``_``.
-
-		Examples::
-
-		    >>> storage = LocalFileStorage("/some/base/folder")
-		    >>> storage.sanitize_name("some_file.gco")
-		    "some_file.gco"
-		    >>> storage.sanitize_name("some_file with (parentheses) and ümläuts and digits 123.gco")
-		    "some_file_with_(parentheses)_and_mluts_and_digits_123.gco"
-		    >>> storage.sanitize_name("pengüino pequeño.stl")
-		    "pengino_pequeo.stl"
-		    >>> storage.sanitize_name("some/folder/still/left.gco")
-		    Traceback (most recent call last):
-		      File "<stdin>", line 1, in <module>
-		    ValueError: name must not contain / or \
-		    >>> storage.sanitize_name("also\\no\\backslashes.gco")
-		    Traceback (most recent call last):
-		      File "<stdin>", line 1, in <module>
-		    ValueError: name must not contain / or \
+		Raises a :class:`ValueError` for a ``name`` containing ``/`` or ``\``. Otherwise
+		slugifies the given ``name`` by converting it to ASCII, leaving ``-``, ``_``, ``.``,
+		``(``, and ``)`` as is.
 		"""
 		if name is None:
 			return None
@@ -615,33 +623,13 @@ class LocalFileStorage(StorageInterface):
 		if "/" in name or "\\" in name:
 			raise ValueError("name must not contain / or \\")
 
-		import string
-		valid_chars = "-_.() {ascii}{digits}".format(ascii=string.ascii_letters, digits=string.digits)
-		sanitized_name = ''.join(c for c in name if c in valid_chars)
-		sanitized_name = sanitized_name.replace(" ", "_")
-		return sanitized_name
+		return self._slugify(name).replace(" ", "_")
 
 	def sanitize_path(self, path):
 		"""
 		Ensures that the on disk representation of ``path`` is located under the configured basefolder. Resolves all
 		relative path elements (e.g. ``..``) and sanitizes folder names using :func:`sanitize_name`. Final path is the
 		absolute path including leading ``basefolder`` path.
-
-		Examples::
-
-		    >>> storage = LocalFileStorage("/some/base/folder")
-		    >>> storage.sanitize_path("folder/with/subfolder")
-		    "/some/base/folder/folder/with/subfolder"
-		    >>> storage.sanitize_path("folder/with/subfolder/../other/folder")
-		    "/some/base/folder/folder/with/other/folder"
-		    >>> storage.sanitize_path("/folder/with/leading/slash")
-		    "/some/base/folder/folder/with/leading/slash"
-		    >>> storage.sanitize_path(".folder/with/leading/dot")
-		    "/some/base/folder/folder/with/leading/dot
-		    >>> storage.sanitize_path("../../folder/out/of/the/basefolder")
-		    Traceback (most recent call last):
-		      File "<stdin>", line 1, in <module>
-		    ValueError: path not contained in base folder: /some/folder/out/of/the/basefolder
 		"""
 		if path[0] == "/" or path[0] == ".":
 			path = path[1:]
@@ -901,7 +889,7 @@ class LocalFileStorage(StorageInterface):
 
 		result = dict()
 		for entry in os.listdir(path):
-			if entry.startswith("."):
+			if is_hidden_path(entry):
 				# no hidden files and folders
 				continue
 
@@ -919,12 +907,7 @@ class LocalFileStorage(StorageInterface):
 				if entry in metadata and isinstance(metadata[entry], dict):
 					entry_data = metadata[entry]
 				else:
-					entry_data = dict(
-						hash=self._create_hash(entry_path),
-						links=[],
-						notes=[]
-					)
-					metadata[entry] = entry_data
+					entry_data = self._add_basic_metadata(path, entry, save=False, metadata=metadata)
 					metadata_dirty = True
 
 				# TODO extract model hash from source if possible to recreate link
@@ -958,6 +941,31 @@ class LocalFileStorage(StorageInterface):
 			self._save_metadata(path, metadata)
 
 		return result
+
+	def _add_basic_metadata(self, path, entry, additional_metadata=None, save=True, metadata=None):
+		if additional_metadata is None:
+			additional_metadata = dict()
+
+		if metadata is None:
+			metadata = self._get_metadata(path)
+
+		entry_data = dict(
+			hash=self._create_hash(os.path.join(path, entry)),
+			links=[],
+			notes=[]
+		)
+
+		if path == self.basefolder and self._old_metadata is not None and entry in self._old_metadata and "gcodeAnalysis" in self._old_metadata[entry]:
+			# if there is still old metadata available and that contains an analysis for this file, use it!
+			entry_data["analysis"] = self._old_metadata[entry]["gcodeAnalysis"]
+
+		entry_data.update(additional_metadata)
+		metadata[entry] = entry_data
+
+		if save:
+			self._save_metadata(path, metadata)
+
+		return entry_data
 
 	def _create_hash(self, path):
 		import hashlib
@@ -993,16 +1001,22 @@ class LocalFileStorage(StorageInterface):
 	def _save_metadata(self, path, metadata):
 		metadata_path = os.path.join(path, ".metadata.yaml")
 
-		fh, metadata_temporary_path = tempfile.mkstemp()
-		os.close(fh)
-
 		with self._metadata_lock:
 			try:
-				with open(metadata_temporary_path, "w") as f:
-					import yaml
-					yaml.safe_dump(metadata, stream=f, default_flow_style=False, indent="  ", allow_unicode=True)
+				import yaml
 				import shutil
-				shutil.move(metadata_temporary_path, metadata_path)
+
+				file_obj = tempfile.NamedTemporaryFile(delete=False)
+				try:
+					yaml.safe_dump(metadata, stream=file_obj, default_flow_style=False, indent="  ", allow_unicode=True)
+					file_obj.close()
+					shutil.move(file_obj.name, metadata_path)
+				finally:
+					try:
+						if os.path.exists(file_obj.name):
+							os.remove(file_obj.name)
+					except Exception as e:
+						self._logger.warn("Could not delete file {}: {}".format(file_obj.name, str(e)))
 			except:
 				self._logger.exception("Error while writing .metadata.yaml to {path}".format(**locals()))
 			else:

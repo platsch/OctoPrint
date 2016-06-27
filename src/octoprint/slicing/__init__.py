@@ -22,7 +22,10 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 import os
 import octoprint.plugin
 import octoprint.events
+import octoprint.util
 from octoprint.settings import settings
+
+import logging
 
 from .exceptions import *
 
@@ -102,6 +105,8 @@ class SlicingManager(object):
 	"""
 
 	def __init__(self, profile_path, printer_profile_manager):
+		self._logger = logging.getLogger(__name__)
+
 		self._profile_path = profile_path
 		self._printer_profile_manager = printer_profile_manager
 
@@ -123,7 +128,11 @@ class SlicingManager(object):
 		plugins = octoprint.plugin.plugin_manager().get_implementations(octoprint.plugin.SlicerPlugin)
 		slicers = dict()
 		for plugin in plugins:
-			slicers[plugin.get_slicer_properties()["type"]] = plugin
+			try:
+				slicers[plugin.get_slicer_properties()["type"]] = plugin
+			except:
+				self._logger.exception("Error while getting properties from slicer {}, ignoring it".format(plugin._identifier))
+				continue
 		self._slicers = slicers
 
 	@property
@@ -398,7 +407,18 @@ class SlicingManager(object):
 				profile.description = description
 
 		path = self.get_profile_path(slicer, name)
+		is_overwrite = os.path.exists(path)
+
+		if is_overwrite and not allow_overwrite:
+			raise ProfileAlreadyExists(slicer, profile.name)
+
 		self._save_profile_to_path(slicer, path, profile, overrides=overrides, allow_overwrite=allow_overwrite)
+
+		payload = dict(slicer=slicer,
+		               profile=name)
+		event = octoprint.events.Events.SLICING_PROFILE_MODIFIED if is_overwrite else octoprint.events.Events.SLICING_PROFILE_ADDED
+		octoprint.events.eventManager().fire(event, payload)
+
 		return profile
 
 	def _temporary_profile(self, slicer, name=None, overrides=None):
@@ -427,6 +447,7 @@ class SlicingManager(object):
 
 		Raises:
 		    ~octoprint.slicing.exceptions.UnknownSlicer: The slicer ``slicer`` is unknown.
+		    ~octoprint.slicing.exceptions.CouldNotDeleteProfile: There was an error while deleting the profile.
 		"""
 
 		if not slicer in self.registered_slicers:
@@ -436,10 +457,17 @@ class SlicingManager(object):
 			raise ValueError("name must be set")
 
 		try:
-			path = self.get_profile_path(slicer, name, must_exist=True)
-		except UnknownProfile:
-			return
-		os.remove(path)
+			try:
+				path = self.get_profile_path(slicer, name, must_exist=True)
+			except UnknownProfile:
+				return
+			os.remove(path)
+		except ProfileException as e:
+			raise e
+		except Exception as e:
+			raise CouldNotDeleteProfile(slicer, name, cause=e)
+		else:
+			octoprint.events.eventManager().fire(octoprint.events.Events.SLICING_PROFILE_DELETED, dict(slicer=slicer, profile=name))
 
 	def all_profiles(self, slicer, require_configured=False):
 		"""
@@ -470,7 +498,7 @@ class SlicingManager(object):
 		profiles = dict()
 		slicer_profile_path = self.get_slicer_profile_path(slicer)
 		for entry in os.listdir(slicer_profile_path):
-			if not entry.endswith(".profile") or entry.startswith("."):
+			if not entry.endswith(".profile") or octoprint.util.is_hidden_path(entry):
 				# we are only interested in profiles and no hidden files
 				continue
 
@@ -531,7 +559,7 @@ class SlicingManager(object):
 		name = self._sanitize(name)
 
 		path = os.path.join(self.get_slicer_profile_path(slicer), "{name}.profile".format(name=name))
-		if not os.path.realpath(path).startswith(self._profile_path):
+		if not os.path.realpath(path).startswith(os.path.realpath(self._profile_path)):
 			raise IOError("Path to profile {name} tried to break out of allows sub path".format(**locals()))
 		if must_exist and not (os.path.exists(path) and os.path.isfile(path)):
 			raise UnknownProfile(slicer, name)

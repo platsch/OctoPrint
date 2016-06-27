@@ -4,6 +4,14 @@ $(function() {
 
         self.loginState = parameters[0];
         self.settingsViewModel = parameters[1];
+        self.printerState = parameters[2];
+
+        self.config_repositoryUrl = ko.observable();
+        self.config_repositoryTtl = ko.observable();
+        self.config_pipCommand = ko.observable();
+        self.config_pipAdditionalArgs = ko.observable();
+
+        self.configurationDialog = $("#settings_plugin_pluginmanager_configurationdialog");
 
         self.plugins = new ItemListHelper(
             "plugin.pluginmanager.installedplugins",
@@ -71,29 +79,55 @@ $(function() {
 
         self.followDependencyLinks = ko.observable(false);
 
+        self.pipAvailable = ko.observable(false);
+        self.pipCommand = ko.observable();
+        self.pipVersion = ko.observable();
+        self.pipUseSudo = ko.observable();
+        self.pipAdditionalArgs = ko.observable();
+
         self.working = ko.observable(false);
         self.workingTitle = ko.observable();
         self.workingDialog = undefined;
         self.workingOutput = undefined;
 
-        self.invalidUrl = ko.computed(function() {
+        self.enableManagement = ko.pureComputed(function() {
+            return !self.printerState.isPrinting();
+        });
+
+        self.enableToggle = function(data) {
+            return self.enableManagement() && data.key != 'pluginmanager';
+        };
+
+        self.enableUninstall = function(data) {
+            return self.enableManagement()
+                && (data.origin != "entry_point" || self.pipAvailable())
+                && !data.bundled
+                && data.key != 'pluginmanager'
+                && !data.pending_uninstall;
+        };
+
+        self.enableRepoInstall = function(data) {
+            return self.enableManagement() && self.pipAvailable() && self.isCompatible(data);
+        };
+
+        self.invalidUrl = ko.pureComputed(function() {
             var url = self.installUrl();
             return url !== undefined && url.trim() != "" && !(_.startsWith(url.toLocaleLowerCase(), "http://") || _.startsWith(url.toLocaleLowerCase(), "https://"));
         });
 
-        self.enableUrlInstall = ko.computed(function() {
+        self.enableUrlInstall = ko.pureComputed(function() {
             var url = self.installUrl();
-            return url !== undefined && url.trim() != "" && !self.invalidUrl();
+            return self.enableManagement() && self.pipAvailable() && url !== undefined && url.trim() != "" && !self.invalidUrl();
         });
 
-        self.invalidArchive = ko.computed(function() {
+        self.invalidArchive = ko.pureComputed(function() {
             var name = self.uploadFilename();
             return name !== undefined && !(_.endsWith(name.toLocaleLowerCase(), ".zip") || _.endsWith(name.toLocaleLowerCase(), ".tar.gz") || _.endsWith(name.toLocaleLowerCase(), ".tgz") || _.endsWith(name.toLocaleLowerCase(), ".tar"));
         });
 
-        self.enableArchiveInstall = ko.computed(function() {
+        self.enableArchiveInstall = ko.pureComputed(function() {
             var name = self.uploadFilename();
-            return name !== undefined && name.trim() != "" && !self.invalidArchive();
+            return self.enableManagement() && self.pipAvailable() && name !== undefined && name.trim() != "" && !self.invalidArchive();
         });
 
         self.uploadElement.fileupload({
@@ -138,17 +172,20 @@ $(function() {
         self.performRepositorySearch = function() {
             var query = self.repositorySearchQuery();
             if (query !== undefined && query.trim() != "") {
+                query = query.toLocaleLowerCase();
                 self.repositoryplugins.changeSearchFunction(function(entry) {
                     return entry && (entry["title"].toLocaleLowerCase().indexOf(query) > -1 || entry["description"].toLocaleLowerCase().indexOf(query) > -1);
                 });
             } else {
                 self.repositoryplugins.resetSearch();
             }
+            return false;
         };
 
         self.fromResponse = function(data) {
             self._fromPluginsResponse(data.plugins);
-            self._fromRepositoryResponse(data.repository)
+            self._fromRepositoryResponse(data.repository);
+            self._fromPipResponse(data.pip);
         };
 
         self._fromPluginsResponse = function(data) {
@@ -169,6 +206,21 @@ $(function() {
             }
         };
 
+        self._fromPipResponse = function(data) {
+            self.pipAvailable(data.available);
+            if (data.available) {
+                self.pipCommand(data.command);
+                self.pipVersion(data.version);
+                self.pipUseSudo(data.use_sudo);
+                self.pipAdditionalArgs(data.additional_args);
+            } else {
+                self.pipCommand(undefined);
+                self.pipVersion(undefined);
+                self.pipUseSudo(undefined);
+                self.pipAdditionalArgs(undefined);
+            }
+        };
+
         self.requestData = function(includeRepo) {
             if (!self.loginState.isAdmin()) {
                 return;
@@ -184,6 +236,10 @@ $(function() {
 
         self.togglePlugin = function(data) {
             if (!self.loginState.isAdmin()) {
+                return;
+            }
+
+            if (!self.enableManagement()) {
                 return;
             }
 
@@ -217,6 +273,10 @@ $(function() {
                 return;
             }
 
+            if (!self.enableManagement()) {
+                return;
+            }
+
             if (self.installed(data)) {
                 self.installPlugin(data.archive, data.title, data.id, data.follow_dependency_links || self.followDependencyLinks());
             } else {
@@ -226,6 +286,10 @@ $(function() {
 
         self.installPlugin = function(url, name, reinstall, followDependencyLinks) {
             if (!self.loginState.isAdmin()) {
+                return;
+            }
+
+            if (!self.enableManagement()) {
                 return;
             }
 
@@ -279,6 +343,10 @@ $(function() {
                 return;
             }
 
+            if (!self.enableManagement()) {
+                return;
+            }
+
             if (data.bundled) return;
             if (data.key == "pluginmanager") return;
 
@@ -305,9 +373,59 @@ $(function() {
                 return;
             }
 
-            self._postCommand("refresh_repository", {}, function(data) {
-                self._fromRepositoryResponse(data.repository);
-            })
+            self.requestData(true);
+        };
+
+        self.showPluginSettings = function() {
+            self._copyConfig();
+            self.configurationDialog.modal();
+        };
+
+        self.savePluginSettings = function() {
+            var pipCommand = self.config_pipCommand();
+            if (pipCommand != undefined && pipCommand.trim() == "") {
+                pipCommand = null;
+            }
+
+            var repository = self.config_repositoryUrl();
+            if (repository != undefined && repository.trim() == "") {
+                repository = null;
+            }
+
+            var repositoryTtl;
+            try {
+                repositoryTtl = parseInt(self.config_repositoryTtl());
+            } catch (ex) {
+                repositoryTtl = null;
+            }
+
+            var pipArgs = self.config_pipAdditionalArgs();
+            if (pipArgs != undefined && pipArgs.trim() == "") {
+                pipArgs = null;
+            }
+
+            var data = {
+                plugins: {
+                    pluginmanager: {
+                        repository: repository,
+                        repository_ttl: repositoryTtl,
+                        pip: pipCommand,
+                        pip_args: pipArgs
+                    }
+                }
+            };
+            self.settingsViewModel.saveData(data, function() {
+                self.configurationDialog.modal("hide");
+                self._copyConfig();
+                self.refreshRepository();
+            });
+        };
+
+        self._copyConfig = function() {
+            self.config_repositoryUrl(self.settingsViewModel.settings.plugins.pluginmanager.repository());
+            self.config_repositoryTtl(self.settingsViewModel.settings.plugins.pluginmanager.repository_ttl());
+            self.config_pipCommand(self.settingsViewModel.settings.plugins.pluginmanager.pip());
+            self.config_pipAdditionalArgs(self.settingsViewModel.settings.plugins.pluginmanager.pip_args());
         };
 
         self.installed = function(data) {
@@ -420,7 +538,7 @@ $(function() {
 
         self.toggleButtonCss = function(data) {
             var icon = self._getToggleCommand(data) == "enable" ? "icon-circle-blank" : "icon-circle";
-            var disabled = (data.key == "pluginmanager") ? " disabled" : "";
+            var disabled = (self.enableToggle(data)) ? "" : " disabled";
 
             return icon + disabled;
         };
@@ -480,11 +598,22 @@ $(function() {
 
                 var name = "Unknown";
                 if (action == "install") {
+                    var unknown = false;
+
                     if (data.hasOwnProperty("plugin")) {
-                        name = data.plugin.name;
+                        if (data.plugin == "unknown") {
+                            unknown = true;
+                        } else {
+                            name = data.plugin.name;
+                        }
                     }
 
-                    if (data.was_reinstalled) {
+                    if (unknown) {
+                        titleSuccess = _.sprintf(gettext("Plugin installed"));
+                        textSuccess = gettext("A plugin was installed successfully, however it was impossible to detect which one. Please Restart OctoPrint to make sure everything will be registered properly");
+                        textRestart = textSuccess;
+                        textReload = textSuccess;
+                    } else if (data.was_reinstalled) {
                         titleSuccess = _.sprintf(gettext("Plugin \"%(name)s\" reinstalled"), {name: name});
                         textSuccess = gettext("The plugin was reinstalled successfully");
                         textRestart = gettext("The plugin was reinstalled successfully, however a restart of OctoPrint is needed for that to take effect.");
@@ -578,5 +707,5 @@ $(function() {
     }
 
     // view model class, parameters for constructor, container to bind to
-    ADDITIONAL_VIEWMODELS.push([PluginManagerViewModel, ["loginStateViewModel", "settingsViewModel"], "#settings_plugin_pluginmanager"]);
+    ADDITIONAL_VIEWMODELS.push([PluginManagerViewModel, ["loginStateViewModel", "settingsViewModel", "printerStateViewModel"], "#settings_plugin_pluginmanager"]);
 });

@@ -80,6 +80,18 @@ def corsResponseHandler(resp):
 	return resp
 
 
+def noCachingResponseHandler(resp):
+	"""
+	``after_request`` handler for blueprints which shall set no caching headers
+	on their responses.
+
+	Sets ``Cache-Control``, ``Pragma`` and ``Expires`` headers accordingly
+	to prevent all client side caching from taking place.
+	"""
+
+	return flask.add_non_caching_response_headers(resp)
+
+
 def optionsAllowOrigin(request):
 	"""
 	Shortcut for request handling for CORS OPTIONS requests to set CORS headers.
@@ -108,7 +120,7 @@ def get_user_for_apikey(apikey):
 		if apikey == settings().get(["api", "key"]) or octoprint.server.appSessionManager.validate(apikey):
 			# master key or an app session key was used
 			return ApiUser()
-		elif octoprint.server.userManager is not None:
+		elif octoprint.server.userManager.enabled:
 			# user key might have been used
 			return octoprint.server.userManager.findUser(apikey=apikey)
 	return None
@@ -129,6 +141,20 @@ def get_api_key(request):
 		return request.headers.get("X-Api-Key")
 
 	return None
+
+
+def get_plugin_hash():
+	from octoprint.plugin import plugin_manager
+
+	plugin_signature = lambda impl: "{}:{}".format(impl._identifier, impl._plugin_version)
+	template_plugins = map(plugin_signature, plugin_manager().get_implementations(octoprint.plugin.TemplatePlugin))
+	asset_plugins = map(plugin_signature, plugin_manager().get_implementations(octoprint.plugin.AssetPlugin))
+	ui_plugins = sorted(set(template_plugins + asset_plugins))
+
+	import hashlib
+	plugin_hash = hashlib.sha1()
+	plugin_hash.update(",".join(ui_plugins))
+	return plugin_hash.hexdigest()
 
 
 #~~ reverse proxy compatible WSGI middleware

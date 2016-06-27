@@ -214,7 +214,7 @@ class PrinterInterface(object):
 		"""
 		raise NotImplementedError()
 
-	def select_file(self, path, sd, printAfterSelect=False):
+	def select_file(self, path, sd, printAfterSelect=False, pos=None):
 		"""
 		Selects the specified ``path`` for printing, specifying if the file is to be found on the ``sd`` or not.
 		Optionally can also directly start the print after selecting the file.
@@ -467,6 +467,6 @@ class PrinterCallback(object):
 		"""
 		pass
 
-class UnknownScript(BaseException):
+class UnknownScript(Exception):
 	def __init__(self, name, *args, **kwargs):
 		self.name = name

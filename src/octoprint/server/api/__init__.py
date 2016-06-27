@@ -19,7 +19,7 @@ import octoprint.server
 import octoprint.plugin
 from octoprint.server import admin_permission, NO_CONTENT
 from octoprint.settings import settings as s, valid_boolean_trues
-from octoprint.server.util import apiKeyRequestHandler, corsResponseHandler
+from octoprint.server.util import noCachingResponseHandler, apiKeyRequestHandler, corsResponseHandler
 from octoprint.server.util.flask import restricted_access, get_json_command_from_request, passive_login
 
 
@@ -41,6 +41,8 @@ from . import languages as api_languages
 
 
 VERSION = "0.1"
+
+api.after_request(noCachingResponseHandler)
 
 api.before_request(apiKeyRequestHandler)
 api.after_request(corsResponseHandler)
@@ -109,6 +111,7 @@ def firstRunSetup():
 					"pass2" in request.values.keys() and request.values["pass1"] == request.values["pass2"]:
 		# configure access control
 		s().setBoolean(["accessControl", "enabled"], True)
+		octoprint.server.userManager.enable()
 		octoprint.server.userManager.addUser(request.values["user"], request.values["pass1"], True, ["user", "admin"])
 		s().setBoolean(["server", "firstRun"], False)
 	elif "ac" in request.values.keys() and not request.values["ac"] in valid_boolean_trues:
@@ -118,6 +121,7 @@ def firstRunSetup():
 
 		octoprint.server.loginManager.anonymous_user = octoprint.users.DummyUser
 		octoprint.server.principals.identity_loaders.appendleft(octoprint.users.dummy_identity_loader)
+		octoprint.server.userManager.disable()
 
 	s().save()
 	return NO_CONTENT
@@ -152,22 +156,25 @@ def performSystemAction():
 		available_actions = s().get(["system", "actions"])
 		for availableAction in available_actions:
 			if availableAction["action"] == action:
+				async = availableAction["async"] if "async" in availableAction else False
+				ignore = availableAction["ignore"] if "ignore" in availableAction else False
 				logger.info("Performing command: %s" % availableAction["command"])
 				try:
-					# Note: we put the command in brackets since sarge (up to the most recently released version) has
-					# a bug concerning shell=True commands. Once sarge 0.1.4 we can upgrade to that and remove this
-					# workaround again
-					#
-					# See https://bitbucket.org/vinay.sajip/sarge/issue/21/behavior-is-not-like-popen-using-shell
-					p = sarge.run([availableAction["command"]], stderr=sarge.Capture(), shell=True)
-					if p.returncode != 0:
-						returncode = p.returncode
-						stderr_text = p.stderr.text
-						logger.warn("Command failed with return code %i: %s" % (returncode, stderr_text))
-						return make_response(("Command failed with return code %i: %s" % (returncode, stderr_text), 500, []))
+					# we run this with shell=True since we have to trust whatever
+					# our admin configured as command and since we want to allow
+					# shell-alike handling here...
+					p = sarge.run(availableAction["command"], stderr=sarge.Capture(), shell=True, async=async)
+					if not async:
+						if not ignore and p.returncode != 0:
+							returncode = p.returncode
+							stderr_text = p.stderr.text
+							logger.warn("Command failed with return code %i: %s" % (returncode, stderr_text))
+							return make_response(("Command failed with return code %i: %s" % (returncode, stderr_text), 500, []))
 				except Exception, e:
-					logger.warn("Command failed: %s" % e)
-					return make_response(("Command failed: %s" % e, 500, []))
+					if not ignore:
+						logger.warn("Command failed: %s" % e)
+						return make_response(("Command failed: %s" % e, 500, []))
+				break
 	return NO_CONTENT
 
 
@@ -176,7 +183,7 @@ def performSystemAction():
 
 @api.route("/login", methods=["POST"])
 def login():
-	if octoprint.server.userManager is not None and "user" in request.values.keys() and "pass" in request.values.keys():
+	if octoprint.server.userManager.enabled and "user" in request.values.keys() and "pass" in request.values.keys():
 		username = request.values["user"]
 		password = request.values["pass"]
 
@@ -191,7 +198,7 @@ def login():
 		user = octoprint.server.userManager.findUser(username)
 		if user is not None:
 			if octoprint.server.userManager.checkPassword(username, password):
-				if octoprint.server.userManager is not None:
+				if octoprint.server.userManager.enabled:
 					user = octoprint.server.userManager.login_user(user)
 					session["usersession.id"] = user.get_session()
 					g.user = user

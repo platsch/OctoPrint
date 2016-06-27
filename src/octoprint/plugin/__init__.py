@@ -281,6 +281,7 @@ class PluginSettings(object):
 			defaults = dict()
 		self.defaults = dict(plugins=dict())
 		self.defaults["plugins"][plugin_key] = defaults
+		self.defaults["plugins"][plugin_key]["_config_version"] = None
 
 		if get_preprocessors is None:
 			get_preprocessors = dict()
@@ -292,31 +293,35 @@ class PluginSettings(object):
 		self.set_preprocessors = dict(plugins=dict())
 		self.set_preprocessors["plugins"][plugin_key] = set_preprocessors
 
-		def prefix_path(path):
-			return ['plugins', self.plugin_key] + path
-
 		def prefix_path_in_args(args, index=0):
 			result = []
 			if index == 0:
-				result.append(prefix_path(args[0]))
+				result.append(self._prefix_path(args[0]))
 				result.extend(args[1:])
 			else:
 				args_before = args[:index - 1]
 				args_after = args[index + 1:]
 				result.extend(args_before)
-				result.append(prefix_path(args[index]))
+				result.append(self._prefix_path(args[index]))
 				result.extend(args_after)
 			return result
 
 		def add_getter_kwargs(kwargs):
-			kwargs.update(defaults=self.defaults, preprocessors=self.get_preprocessors)
+			if not "defaults" in kwargs:
+				kwargs.update(defaults=self.defaults)
+			if not "preprocessors" in kwargs:
+				kwargs.update(preprocessors=self.get_preprocessors)
 			return kwargs
 
 		def add_setter_kwargs(kwargs):
-			kwargs.update(defaults=self.defaults, preprocessors=self.set_preprocessors)
+			if not "defaults" in kwargs:
+				kwargs.update(defaults=self.defaults)
+			if not "preprocessors" in kwargs:
+				kwargs.update(preprocessors=self.set_preprocessors)
 			return kwargs
 
 		self.access_methods = dict(
+			has        =("has",        prefix_path_in_args, add_getter_kwargs),
 			get        =("get",        prefix_path_in_args, add_getter_kwargs),
 			get_int    =("getInt",     prefix_path_in_args, add_getter_kwargs),
 			get_float  =("getFloat",   prefix_path_in_args, add_getter_kwargs),
@@ -324,7 +329,8 @@ class PluginSettings(object):
 			set        =("set",        prefix_path_in_args, add_setter_kwargs),
 			set_int    =("setInt",     prefix_path_in_args, add_setter_kwargs),
 			set_float  =("setFloat",   prefix_path_in_args, add_setter_kwargs),
-			set_boolean=("setBoolean", prefix_path_in_args, add_setter_kwargs)
+			set_boolean=("setBoolean", prefix_path_in_args, add_setter_kwargs),
+			remove     =("remove",     prefix_path_in_args, lambda x: x)
 		)
 		self.deprecated_access_methods = dict(
 			getInt    ="get_int",
@@ -334,6 +340,17 @@ class PluginSettings(object):
 			setFloat  ="set_float",
 			setBoolean="set_boolean"
 		)
+
+	def _prefix_path(self, path=None):
+		if path is None:
+			path = list()
+		return ['plugins', self.plugin_key] + path
+
+	def global_has(self, path, **kwargs):
+		return self.settings.has(path, **kwargs)
+
+	def global_remove(self, path, **kwargs):
+		return self.settings.remove(path, **kwargs)
 
 	def global_get(self, path, **kwargs):
 		"""
@@ -418,6 +435,33 @@ class PluginSettings(object):
 			filename += "_" + postfix
 		filename += ".log"
 		return os.path.join(self.settings.getBaseFolder("logs"), filename)
+
+	@deprecated("PluginSettings.get_plugin_data_folder has been replaced by OctoPrintPlugin.get_plugin_data_folder",
+	            includedoc="Replaced by :func:`~octoprint.plugin.types.OctoPrintPlugin.get_plugin_data_folder`",
+	            since="1.2.0")
+	def get_plugin_data_folder(self):
+		path = os.path.join(self.settings.getBaseFolder("data"), self.plugin_key)
+		if not os.path.isdir(path):
+			os.makedirs(path)
+		return path
+
+	def get_all_data(self, **kwargs):
+		merged = kwargs.get("merged", True)
+		asdict = kwargs.get("asdict", True)
+		defaults = kwargs.get("defaults", self.defaults)
+		preprocessors = kwargs.get("preprocessors", self.get_preprocessors)
+
+		kwargs.update(dict(
+			merged=merged,
+			asdict=asdict,
+			defaults=defaults,
+			preprocessors=preprocessors
+		))
+
+		return self.settings.get(self._prefix_path(), **kwargs)
+
+	def clean_all_data(self):
+		self.settings.remove(self._prefix_path())
 
 	def __getattr__(self, item):
 		all_access_methods = self.access_methods.keys() + self.deprecated_access_methods.keys()

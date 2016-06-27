@@ -5,6 +5,9 @@ $(function() {
         self.loginState = parameters[0];
         self.settings = parameters[1];
 
+        // TODO remove with release of 1.3.0 and switch to OctoPrint.coreui usage
+        self.tabTracking = parameters[2];
+
         self._createToolEntry = function () {
             return {
                 name: ko.observable(),
@@ -23,6 +26,9 @@ $(function() {
         self.extrusionAmount = ko.observable(undefined);
         self.controls = ko.observableArray([]);
 
+        self.distances = ko.observableArray([0.1, 1, 10, 100]);
+        self.distance = ko.observable(10);
+
         self.tools = ko.observableArray([]);
 
         self.feedRate = ko.observable(100);
@@ -37,10 +43,10 @@ $(function() {
 
         self.keycontrolActive = ko.observable(false);
         self.keycontrolHelpActive = ko.observable(false);
-        self.keycontrolPossible = ko.computed(function () {
+        self.keycontrolPossible = ko.pureComputed(function () {
             return self.isOperational() && !self.isPrinting() && self.loginState.isUser() && !$.browser.mobile;
         });
-        self.showKeycontrols = ko.computed(function () {
+        self.showKeycontrols = ko.pureComputed(function () {
             return self.keycontrolActive() && self.keycontrolPossible();
         });
 
@@ -246,7 +252,7 @@ $(function() {
 
         self.sendJogCommand = function (axis, multiplier, distance) {
             if (typeof distance === "undefined")
-                distance = $('#jog_distance button.active').data('distance');
+                distance = self.distance();
             if (self.settings.printerProfiles.currentProfileData() && self.settings.printerProfiles.currentProfileData()["axes"] && self.settings.printerProfiles.currentProfileData()["axes"][axis] && self.settings.printerProfiles.currentProfileData()["axes"][axis]["inverted"]()) {
                 multiplier *= -1;
             }
@@ -415,31 +421,51 @@ $(function() {
 
         self.onSettingsBeforeSave = self.updateRotatorWidth;
 
+        self._disableWebcam = function() {
+            // only disable webcam stream if tab is out of focus for more than 5s, otherwise we might cause
+            // more load by the constant connection creation than by the actual webcam stream
+            self.webcamDisableTimeout = setTimeout(function () {
+                $("#webcam_image").attr("src", "");
+            }, 5000);
+        };
+
+        self._enableWebcam = function() {
+            if (self.tabTracking.selectedTab != "#control" || !self.tabTracking.browserTabVisible) {
+                return;
+            }
+
+            if (self.webcamDisableTimeout != undefined) {
+                clearTimeout(self.webcamDisableTimeout);
+            }
+            var webcamImage = $("#webcam_image");
+            var currentSrc = webcamImage.attr("src");
+            if (currentSrc === undefined || currentSrc.trim() == "") {
+                var newSrc = CONFIG_WEBCAM_STREAM;
+                if (CONFIG_WEBCAM_STREAM.lastIndexOf("?") > -1) {
+                    newSrc += "&";
+                } else {
+                    newSrc += "?";
+                }
+                newSrc += new Date().getTime();
+
+                self.updateRotatorWidth();
+                webcamImage.attr("src", newSrc);
+            }
+        };
+
         self.onTabChange = function (current, previous) {
             if (current == "#control") {
-                if (self.webcamDisableTimeout != undefined) {
-                    clearTimeout(self.webcamDisableTimeout);
-                }
-                var webcamImage = $("#webcam_image");
-                var currentSrc = webcamImage.attr("src");
-                if (currentSrc === undefined || currentSrc.trim() == "") {
-                    var newSrc = CONFIG_WEBCAM_STREAM;
-                    if (CONFIG_WEBCAM_STREAM.lastIndexOf("?") > -1) {
-                        newSrc += "&";
-                    } else {
-                        newSrc += "?";
-                    }
-                    newSrc += new Date().getTime();
-
-                    self.updateRotatorWidth();
-                    webcamImage.attr("src", newSrc);
-                }
+                self._enableWebcam();
             } else if (previous == "#control") {
-                // only disable webcam stream if tab is out of focus for more than 5s, otherwise we might cause
-                // more load by the constant connection creation than by the actual webcam stream
-                self.webcamDisableTimeout = setTimeout(function () {
-                    $("#webcam_image").attr("src", "");
-                }, 5000);
+                self._disableWebcam();
+            }
+        };
+
+        self.onBrowserTabVisibilityChange = function(status) {
+            if (status) {
+                self._enableWebcam();
+            } else {
+                self._disableWebcam();
             }
         };
 
@@ -561,11 +587,15 @@ $(function() {
             }
         };
 
+        self.stripDistanceDecimal = function(distance) {
+            return distance.toString().replace(".", "");
+        };
+
     }
 
     OCTOPRINT_VIEWMODELS.push([
         ControlViewModel,
-        ["loginStateViewModel", "settingsViewModel"],
+        ["loginStateViewModel", "settingsViewModel", "tabTracking"],
         "#control"
     ]);
 });

@@ -6,30 +6,47 @@ __license__ = 'GNU Affero General Public License http://www.gnu.org/licenses/agp
 __copyright__ = "Copyright (C) 2015 The OctoPrint Project - Released under terms of the AGPLv3 License"
 
 import os
+import datetime
 
 from collections import defaultdict
 from flask import request, g, url_for, make_response, render_template, send_from_directory, redirect
 
 import octoprint.plugin
 
-from octoprint.server import app, userManager, pluginManager, gettext, debug, LOCALES, VERSION, DISPLAY_VERSION, UI_API_KEY
+from octoprint.server import app, userManager, pluginManager, gettext, \
+	debug, LOCALES, VERSION, DISPLAY_VERSION, UI_API_KEY, BRANCH, preemptiveCache, \
+	NOT_MODIFIED
 from octoprint.settings import settings
+from octoprint.filemanager import get_all_extensions
+
+import re
 
 from . import util
 
 import logging
 _logger = logging.getLogger(__name__)
 
-@app.route("/")
-@util.flask.cached(refreshif=lambda: util.flask.cache_check_headers() or "_refresh" in request.values, key=lambda: "view/%s/%s" % (request.path, g.locale))
-def index():
+_valid_id_re = re.compile("[a-z_]+")
+_valid_div_re = re.compile("[a-zA-Z_-]+")
 
+@app.route("/")
+@util.flask.preemptively_cached(cache=preemptiveCache,
+                                data=lambda: dict(path=request.path, base_url=request.url_root, query_string="l10n={}".format(g.locale.language) if g.locale else "en"),
+                                unless=lambda: request.url_root in settings().get(["server", "preemptiveCache", "exceptions"]))
+@util.flask.conditional(lambda: _check_etag_and_lastmodified_for_index(), NOT_MODIFIED)
+@util.flask.cached(timeout=-1,
+                   refreshif=lambda cached: _validate_cache_for_index(cached),
+                   key=lambda: "view:{}:{}".format(request.base_url, g.locale.language if g.locale else "en"),
+                   unless_response=lambda response: util.flask.cache_check_response_headers(response))
+@util.flask.etagged(lambda _: _compute_etag_for_index())
+@util.flask.lastmodified(lambda _: _compute_date_for_index())
+def index():
 	#~~ a bunch of settings
 
 	enable_gcodeviewer = settings().getBoolean(["gcodeViewer", "enabled"])
 	enable_timelapse = (settings().get(["webcam", "snapshot"]) and settings().get(["webcam", "ffmpeg"]))
-	enable_systemmenu = settings().get(["system"]) is not None and settings().get(["system", "actions"]) is not None and len(settings().get(["system", "actions"])) > 0
-	enable_accesscontrol = userManager is not None
+	enable_systemmenu = settings().get(["system"]) is not None and settings().get(["system", "actions"]) is not None
+	enable_accesscontrol = userManager.enabled
 	preferred_stylesheet = settings().get(["devel", "stylesheet"])
 	locales = dict((l.language, dict(language=l.language, display=l.display_name, english=l.english_name)) for l in LOCALES)
 
@@ -44,6 +61,7 @@ def index():
 		tab=dict(div=lambda x: "tab_plugin_" + x, template=lambda x: x + "_tab.jinja2", to_entry=lambda data: (data["name"], data)),
 		settings=dict(div=lambda x: "settings_plugin_" + x, template=lambda x: x + "_settings.jinja2", to_entry=lambda data: (data["name"], data)),
 		usersettings=dict(div=lambda x: "usersettings_plugin_" + x, template=lambda x: x + "_usersettings.jinja2", to_entry=lambda data: (data["name"], data)),
+		about=dict(div=lambda x: "about_plugin_" + x, template=lambda x: x + "_about.jinja2", to_entry=lambda data: (data["name"], data)),
 		generic=dict(template=lambda x: x + ".jinja2", to_entry=lambda data: data)
 	)
 
@@ -54,6 +72,7 @@ def index():
 		tab=dict(add="append", key="name"),
 		settings=dict(add="custom_append", key="name", custom_add_entries=lambda missing: dict(section_plugins=(gettext("Plugins"), None)), custom_add_order=lambda missing: ["section_plugins"] + missing),
 		usersettings=dict(add="append", key="name"),
+		about=dict(add="append", key="name"),
 		generic=dict(add="append", key=None)
 	)
 
@@ -109,7 +128,7 @@ def index():
 	# sidebar
 
 	templates["sidebar"]["entries"]= dict(
-		connection=(gettext("Connection"), dict(template="sidebar/connection.jinja2", _div="connection", icon="signal", styles_wrapper=["display: none"], data_bind="visible: loginState.isAdmin")),
+		connection=(gettext("Connection"), dict(template="sidebar/connection.jinja2", _div="connection", icon="signal", styles_wrapper=["display: none"], data_bind="visible: loginState.isUser")),
 		state=(gettext("State"), dict(template="sidebar/state.jinja2", _div="state", icon="info-sign")),
 		files=(gettext("Files"), dict(template="sidebar/files.jinja2", _div="files", icon="list", classes_content=["overflow_visible"], template_header="sidebar/files_header.jinja2"))
 	)
@@ -148,6 +167,7 @@ def index():
 		folders=(gettext("Folders"), dict(template="dialogs/settings/folders.jinja2", _div="settings_folders", custom_bindings=False)),
 		appearance=(gettext("Appearance"), dict(template="dialogs/settings/appearance.jinja2", _div="settings_appearance", custom_bindings=False)),
 		logs=(gettext("Logs"), dict(template="dialogs/settings/logs.jinja2", _div="settings_logs")),
+		server=(gettext("Server"), dict(template="dialogs/settings/server.jinja2", _div="settings_server", custom_bindings=False)),
 	)
 	if enable_accesscontrol:
 		templates["settings"]["entries"]["accesscontrol"] = (gettext("Access Control"), dict(template="dialogs/settings/accesscontrol.jinja2", _div="settings_users", custom_bindings=False))
@@ -160,6 +180,17 @@ def index():
 			interface=(gettext("Interface"), dict(template="dialogs/usersettings/interface.jinja2", _div="usersettings_interface", custom_bindings=False)),
 		)
 
+	# about dialog
+
+	templates["about"]["entries"] = dict(
+		about=("About OctoPrint", dict(template="dialogs/about/about.jinja2", _div="about_about", custom_bindings=False)),
+		license=("OctoPrint License", dict(template="dialogs/about/license.jinja2", _div="about_license", custom_bindings=False)),
+		thirdparty=("Third Party Licenses", dict(template="dialogs/about/thirdparty.jinja2", _div="about_thirdparty", custom_bindings=False)),
+		authors=("Authors", dict(template="dialogs/about/authors.jinja2", _div="about_authors", custom_bindings=False)),
+		changelog=("Changelog", dict(template="dialogs/about/changelog.jinja2", _div="about_changelog", custom_bindings=False)),
+		supporters=("Supporters", dict(template="dialogs/about/supporters.jinja2", _div="about_sponsors", custom_bindings=False))
+	)
+
 	# extract data from template plugins
 
 	template_plugins = pluginManager.get_implementations(octoprint.plugin.TemplatePlugin)
@@ -170,16 +201,20 @@ def index():
 		name = implementation._identifier
 		plugin_names.add(name)
 
-		vars = implementation.get_template_vars()
+		try:
+			vars = implementation.get_template_vars()
+			configs = implementation.get_template_configs()
+		except:
+			_logger.exception("Error while retrieving template data for plugin {}, ignoring it".format(name))
+			continue
+
 		if not isinstance(vars, dict):
 			vars = dict()
+		if not isinstance(configs, (list, tuple)):
+			configs = []
 
 		for var_name, var_value in vars.items():
 			plugin_vars["plugin_" + name + "_" + var_name] = var_value
-
-		configs = implementation.get_template_configs()
-		if not isinstance(configs, (list, tuple)):
-			configs = []
 
 		includes = _process_template_configs(name, implementation, configs, template_rules)
 
@@ -223,9 +258,30 @@ def index():
 		# finally add anything that's not included in our order yet
 		sorted_missing = list(missing_in_order)
 		if template_sorting[t]["key"] is not None:
-			# anything but navbar and generic components get sorted by their name
-			if template_sorting[t]["key"] == "name":
-				sorted_missing = sorted(missing_in_order, key=lambda x: templates[t]["entries"][x][0])
+			# default extractor: works with entries that are dicts and entries that are 2-tuples with the
+			# entry data at index 1
+			def extractor(item, key):
+				if isinstance(item, dict) and key in item:
+					return item[key]
+				elif isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], dict) and key in item[1]:
+					return item[1][key]
+
+				return None
+
+			# if template type provides custom extractor, make sure its exceptions are handled
+			if "key_extractor" in template_sorting[t] and callable(template_sorting[t]["key_extractor"]):
+				def create_safe_extractor(extractor):
+					def f(x, k):
+						try:
+							return extractor(x, k)
+						except:
+							_logger.exception("Error while extracting sorting keys for template {}".format(t))
+							return None
+					return f
+				extractor = create_safe_extractor(template_sorting[t]["key_extractor"])
+
+			sort_key = template_sorting[t]["key"]
+			sorted_missing = sorted(missing_in_order, key=lambda x: extractor(templates[t]["entries"][x], sort_key))
 
 		if template_sorting[t]["add"] == "prepend":
 			templates[t]["order"] = sorted_missing + templates[t]["order"]
@@ -240,30 +296,40 @@ def index():
 
 	#~~ prepare full set of template vars for rendering
 
+	now = datetime.datetime.utcnow()
+	first_run = settings().getBoolean(["server", "firstRun"]) and userManager.enabled and not userManager.hasBeenCustomized()
 	render_kwargs = dict(
 		webcamStream=settings().get(["webcam", "stream"]),
 		enableTemperatureGraph=settings().get(["feature", "temperatureGraph"]),
-		enableAccessControl=userManager is not None,
+		enableAccessControl=userManager.enabled,
 		enableSdSupport=settings().get(["feature", "sdSupport"]),
-		firstRun=settings().getBoolean(["server", "firstRun"]) and (userManager is None or not userManager.hasBeenCustomized()),
+		firstRun=first_run,
 		debug=debug,
 		version=VERSION,
 		display_version=DISPLAY_VERSION,
+		branch=BRANCH,
 		gcodeMobileThreshold=settings().get(["gcodeViewer", "mobileSizeThreshold"]),
 		gcodeThreshold=settings().get(["gcodeViewer", "sizeThreshold"]),
 		uiApiKey=UI_API_KEY,
 		templates=templates,
 		pluginNames=plugin_names,
-		locales=locales
+		locales=locales,
+		now=now,
+		supportedExtensions=map(lambda ext: ".{}".format(ext), get_all_extensions())
 	)
 	render_kwargs.update(plugin_vars)
 
 	#~~ render!
 
-	return render_template(
+	response = make_response(render_template(
 		"index.jinja2",
 		**render_kwargs
-	)
+	))
+
+	if first_run:
+		response = util.flask.add_non_caching_response_headers(response)
+
+	return response
 
 
 def _process_template_configs(name, implementation, configs, rules):
@@ -302,10 +368,13 @@ def _process_template_configs(name, implementation, configs, rules):
 					app.jinja_env.get_or_select_template(data["template"])
 				except TemplateNotFound:
 					pass
+				except:
+					_logger.exception("Error in template {}, not going to include it".format(data["template"]))
 				else:
 					includes[template_type].append(rule["to_entry"](data))
 
 	return includes
+
 
 def _process_template_config(name, implementation, rule, config=None, counter=1):
 	if "mandatory" in rule:
@@ -326,6 +395,9 @@ def _process_template_config(name, implementation, rule, config=None, counter=1)
 		data["_div"] = rule["div"](name)
 		if "suffix" in data:
 			data["_div"] = data["_div"] + data["suffix"]
+		if not _valid_div_re.match(data["_div"]):
+			_logger.warn("Template config {} contains invalid div identifier {}, skipping it".format(name, data["_div"]))
+			return None
 
 	if not "template" in data:
 		data["template"] = rule["template"](name)
@@ -337,6 +409,7 @@ def _process_template_config(name, implementation, rule, config=None, counter=1)
 		data_bind = "allowBindings: true"
 		if "data_bind" in data:
 			data_bind = data_bind + ", " + data["data_bind"]
+		data_bind = data_bind.replace("\"", "\\\"")
 		data["data_bind"] = data_bind
 
 	data["_key"] = "plugin_" + name
@@ -345,76 +418,23 @@ def _process_template_config(name, implementation, rule, config=None, counter=1)
 
 	return data
 
+
 @app.route("/robots.txt")
+@util.flask.cached(timeout=-1)
 def robotsTxt():
 	return send_from_directory(app.static_folder, "robots.txt")
 
 
 @app.route("/i18n/<string:locale>/<string:domain>.js")
-@util.flask.cached(refreshif=lambda: util.flask.cache_check_headers() or "_refresh" in request.values, key=lambda: "view/%s/%s" % (request.path, g.locale))
+@util.flask.conditional(lambda: _check_etag_and_lastmodified_for_i18n(), NOT_MODIFIED)
+@util.flask.etagged(lambda _: _compute_etag_for_i18n(request.view_args["locale"], request.view_args["domain"]))
+@util.flask.lastmodified(lambda _: _compute_date_for_i18n(request.view_args["locale"], request.view_args["domain"]))
 def localeJs(locale, domain):
 	messages = dict()
 	plural_expr = None
 
 	if locale != "en":
-		from flask import _request_ctx_stack
-		from babel.messages.pofile import read_po
-
-		def messages_from_po(base_path, locale, domain):
-			path = os.path.join(base_path, locale)
-			if not os.path.isdir(path):
-				return None, None
-
-			path = os.path.join(path, "LC_MESSAGES", "{domain}.po".format(**locals()))
-			if not os.path.isfile(path):
-				return None, None
-
-			messages = dict()
-			with file(path) as f:
-				catalog = read_po(f, locale=locale, domain=domain)
-
-				for message in catalog:
-					message_id = message.id
-					if isinstance(message_id, (list, tuple)):
-						message_id = message_id[0]
-					messages[message_id] = message.string
-
-			return messages, catalog.plural_expr
-
-		user_base_path = os.path.join(settings().getBaseFolder("translations"))
-		user_plugin_path = os.path.join(user_base_path, "_plugins")
-
-		# plugin translations
-		plugins = octoprint.plugin.plugin_manager().enabled_plugins
-		for name, plugin in plugins.items():
-			dirs = [os.path.join(user_plugin_path, name), os.path.join(plugin.location, 'translations')]
-			for dirname in dirs:
-				if not os.path.isdir(dirname):
-					continue
-
-				plugin_messages, _ = messages_from_po(dirname, locale, domain)
-
-				if plugin_messages is not None:
-					messages = octoprint.util.dict_merge(messages, plugin_messages)
-					_logger.debug("Using translation folder {dirname} for locale {locale} of plugin {name}".format(**locals()))
-					break
-			else:
-				_logger.debug("No translations for locale {locale} for plugin {name}".format(**locals()))
-
-		# core translations
-		ctx = _request_ctx_stack.top
-		base_path = os.path.join(ctx.app.root_path, "translations")
-
-		dirs = [user_base_path, base_path]
-		for dirname in dirs:
-			core_messages, plural_expr = messages_from_po(dirname, locale, domain)
-
-			if core_messages is not None:
-				messages = octoprint.util.dict_merge(messages, core_messages)
-				_logger.debug("Using translation folder {dirname} for locale {locale} of core translations".format(**locals()))
-				break
-		else:
-			_logger.debug("No core translations for locale {locale}".format(**locals()))
+		messages, plural_expr = _get_translations(locale, domain)
 
 	catalog = dict(
 		messages=messages,
@@ -432,3 +452,192 @@ def plugin_assets(name, filename):
 	return redirect(url_for("plugin." + name + ".static", filename=filename))
 
 
+def _compute_etag_for_index(files=None, lastmodified=None):
+	if files is None:
+		files = _files_for_index()
+	if lastmodified is None:
+		lastmodified = _compute_date(files)
+	if lastmodified and not isinstance(lastmodified, basestring):
+		from werkzeug.http import http_date
+		lastmodified = http_date(lastmodified)
+
+	from octoprint import __version__
+	from octoprint.server import UI_API_KEY
+
+	import hashlib
+	hash = hashlib.sha1()
+	hash.update(__version__)
+	hash.update(UI_API_KEY)
+	hash.update(",".join(sorted(files)))
+	if lastmodified:
+		hash.update(lastmodified)
+	return hash.hexdigest()
+
+
+def _compute_etag_for_i18n(locale, domain, files=None, lastmodified=None):
+	if files is None:
+		files = _get_all_translationfiles(locale, domain)
+	if lastmodified is None:
+		lastmodified = _compute_date(files)
+	if lastmodified and not isinstance(lastmodified, basestring):
+		from werkzeug.http import http_date
+		lastmodified = http_date(lastmodified)
+
+	import hashlib
+	hash = hashlib.sha1()
+	hash.update(",".join(sorted(files)))
+	if lastmodified:
+		hash.update(lastmodified)
+	return hash.hexdigest()
+
+
+def _compute_date_for_i18n(locale, domain):
+	return _compute_date(_get_all_translationfiles(locale, domain))
+
+
+def _compute_date_for_index():
+	return _compute_date(_files_for_index())
+
+
+def _validate_cache_for_index(cached):
+	no_cache_headers = util.flask.cache_check_headers()
+	refresh_flag = "_refresh" in request.values
+	etag_different = _compute_etag_for_index() != cached.get_etag()[0]
+
+	return no_cache_headers or refresh_flag or etag_different
+
+
+def _files_for_index():
+	"""
+	Collects all paths of files that the index page depends on.
+
+	The relevant files are:
+
+	  * all jinja2 templates: they might be used within the index page, so
+	    any changes here change the rendering outcome
+	  * all defined assets: if one of them changes, the webassets bundle will
+	    be regenerated and hence the URL included in the cached page won't be
+	    valid anymore
+	  * all translation files used for our current locale: if any of those change
+	    we also need to re-render
+	"""
+
+	templates = _get_all_templates()
+	assets = _get_all_assets()
+	translations = _get_all_translationfiles(g.locale.language if g.locale else "en", "messages")
+	return sorted(set(templates + assets + translations))
+
+
+def _compute_date(files):
+	from datetime import datetime
+	timestamps = map(lambda path: os.stat(path).st_mtime, files)
+	max_timestamp = max(*timestamps) if timestamps else None
+	if max_timestamp:
+		# we set the micros to 0 since microseconds are not speced for HTTP
+		max_timestamp = datetime.fromtimestamp(max_timestamp).replace(microsecond=0)
+	return max_timestamp
+
+
+def _check_etag_and_lastmodified_for_index():
+	files = _files_for_index()
+	lastmodified = _compute_date(files)
+	lastmodified_ok = util.flask.check_lastmodified(lastmodified)
+	etag_ok = util.flask.check_etag(_compute_etag_for_index(files, lastmodified))
+	return etag_ok and lastmodified_ok
+
+
+def _check_etag_and_lastmodified_for_i18n():
+	locale = request.view_args["locale"]
+	domain = request.view_args["domain"]
+
+	etag_ok = util.flask.check_etag(_compute_etag_for_i18n(request.view_args["locale"], request.view_args["domain"]))
+
+	lastmodified = _compute_date_for_i18n(locale, domain)
+	lastmodified_ok = lastmodified is None or util.flask.check_lastmodified(lastmodified)
+
+	return etag_ok and lastmodified_ok
+
+
+def _get_all_templates():
+	from octoprint.util.jinja import get_all_template_paths
+	return get_all_template_paths(app.jinja_loader)
+
+
+def _get_all_assets():
+	from octoprint.util.jinja import get_all_asset_paths
+	return get_all_asset_paths(app.jinja_env.assets_environment)
+
+
+def _get_all_translationfiles(locale, domain):
+	from flask import _request_ctx_stack
+
+	def get_po_path(basedir, locale, domain):
+		path = os.path.join(basedir, locale)
+		if not os.path.isdir(path):
+			return None
+
+		path = os.path.join(path, "LC_MESSAGES", "{domain}.po".format(**locals()))
+		if not os.path.isfile(path):
+			return None
+
+		return path
+
+	po_files = []
+
+	user_base_path = os.path.join(settings().getBaseFolder("translations"))
+	user_plugin_path = os.path.join(user_base_path, "_plugins")
+
+	# plugin translations
+	plugins = octoprint.plugin.plugin_manager().enabled_plugins
+	for name, plugin in plugins.items():
+		dirs = [os.path.join(user_plugin_path, name), os.path.join(plugin.location, 'translations')]
+		for dirname in dirs:
+			if not os.path.isdir(dirname):
+				continue
+
+			po_file = get_po_path(dirname, locale, domain)
+			if po_file:
+				po_files.append(po_file)
+				break
+
+	# core translations
+	ctx = _request_ctx_stack.top
+	base_path = os.path.join(ctx.app.root_path, "translations")
+
+	dirs = [user_base_path, base_path]
+	for dirname in dirs:
+		po_file = get_po_path(dirname, locale, domain)
+		if po_file:
+			po_files.append(po_file)
+			break
+
+	return po_files
+
+
+def _get_translations(locale, domain):
+	from babel.messages.pofile import read_po
+	from octoprint.util import dict_merge
+
+	messages = dict()
+	plural_expr = None
+
+	def messages_from_po(path, locale, domain):
+		messages = dict()
+		with file(path) as f:
+			catalog = read_po(f, locale=locale, domain=domain)
+
+			for message in catalog:
+				message_id = message.id
+				if isinstance(message_id, (list, tuple)):
+					message_id = message_id[0]
+				messages[message_id] = message.string
+
+		return messages, catalog.plural_expr
+
+	po_files = _get_all_translationfiles(locale, domain)
+	for po_file in po_files:
+		po_messages, plural_expr = messages_from_po(po_file, locale, domain)
+		if po_messages is not None:
+			messages = dict_merge(messages, po_messages)
+
+	return messages, plural_expr

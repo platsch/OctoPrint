@@ -428,7 +428,9 @@ class PluginManager(object):
 	It is able to discover plugins both through possible file system locations as well as customizable entry points.
 	"""
 
-	def __init__(self, plugin_folders, plugin_types, plugin_entry_points, logging_prefix=None, plugin_disabled_list=None, plugin_restart_needing_hooks=None, plugin_obsolete_hooks=None, plugin_validators=None):
+	def __init__(self, plugin_folders, plugin_types, plugin_entry_points, logging_prefix=None,
+	             plugin_disabled_list=None, plugin_restart_needing_hooks=None, plugin_obsolete_hooks=None,
+	             plugin_validators=None):
 		self.logger = logging.getLogger(__name__)
 
 		if logging_prefix is None:
@@ -453,6 +455,8 @@ class PluginManager(object):
 
 		self.implementation_injects = dict()
 		self.implementation_inject_factories = []
+		self.implementation_pre_inits = []
+		self.implementation_post_inits = []
 
 		self.on_plugin_loaded = lambda *args, **kwargs: None
 		self.on_plugin_unloaded = lambda *args, **kwargs: None
@@ -849,33 +853,47 @@ class PluginManager(object):
 			return False
 		return hook in self.plugin_obsolete_hooks
 
-	def initialize_implementations(self, additional_injects=None, additional_inject_factories=None):
+	def initialize_implementations(self, additional_injects=None, additional_inject_factories=None, additional_pre_inits=None, additional_post_inits=None):
 		for name, plugin in self.enabled_plugins.items():
 			self.initialize_implementation_of_plugin(name, plugin,
 			                                         additional_injects=additional_injects,
-			                                         additional_inject_factories=additional_inject_factories)
+			                                         additional_inject_factories=additional_inject_factories,
+			                                         additional_pre_inits=additional_pre_inits,
+			                                         additional_post_inits=additional_post_inits)
 
-		self.logger.info("Initialized {count} plugin(s)".format(count=len(self.plugin_implementations)))
+		self.logger.info("Initialized {count} plugin implementation(s)".format(count=len(self.plugin_implementations)))
 
-	def initialize_implementation_of_plugin(self, name, plugin, additional_injects=None, additional_inject_factories=None):
+	def initialize_implementation_of_plugin(self, name, plugin, additional_injects=None, additional_inject_factories=None, additional_pre_inits=None, additional_post_inits=None):
 		if plugin.implementation is None:
 			return
 
 		return self.initialize_implementation(name, plugin, plugin.implementation,
 		                               additional_injects=additional_injects,
-		                               additional_inject_factories=additional_inject_factories)
+		                               additional_inject_factories=additional_inject_factories,
+		                               additional_pre_inits=additional_pre_inits,
+		                               additional_post_inits=additional_post_inits)
 
-	def initialize_implementation(self, name, plugin, implementation, additional_injects=None, additional_inject_factories=None):
+	def initialize_implementation(self, name, plugin, implementation, additional_injects=None, additional_inject_factories=None, additional_pre_inits=None, additional_post_inits=None):
 		if additional_injects is None:
 			additional_injects = dict()
 		if additional_inject_factories is None:
 			additional_inject_factories = []
+		if additional_pre_inits is None:
+			additional_pre_inits = []
+		if additional_post_inits is None:
+			additional_post_inits = []
 
 		injects = self.implementation_injects
 		injects.update(additional_injects)
 
 		inject_factories = self.implementation_inject_factories
 		inject_factories += additional_inject_factories
+
+		pre_inits = self.implementation_pre_inits
+		pre_inits += additional_pre_inits
+
+		post_inits = self.implementation_post_inits
+		post_inits += additional_post_inits
 
 		try:
 			kwargs = dict(injects)
@@ -904,7 +922,15 @@ class PluginManager(object):
 							for arg, value in return_value.items():
 								setattr(implementation, "_" + arg, value)
 
+			# execute any additional pre init methods
+			for pre_init in pre_inits:
+				pre_init(name, implementation)
+
 			implementation.initialize()
+
+			# execute any additional post init methods
+			for post_init in post_inits:
+				post_init(name, implementation)
 
 		except Exception as e:
 			self._deactivate_plugin(name, plugin)
@@ -929,15 +955,13 @@ class PluginManager(object):
 			self.logger.info("No plugins available")
 		else:
 			self.logger.info("{count} plugin(s) registered with the system:\n{plugins}".format(count=len(all_plugins), plugins="\n".join(
-				sorted(
-					map(lambda x: "| " + x.long_str(show_bundled=show_bundled,
-					                                bundled_strs=bundled_str,
-					                                show_location=show_location,
-					                                location_str=location_str,
-					                                show_enabled=show_enabled,
-					                                enabled_strs=enabled_str),
-					    self.enabled_plugins.values())
-				)
+				map(lambda x: "| " + x.long_str(show_bundled=show_bundled,
+				                                bundled_strs=bundled_str,
+				                                show_location=show_location,
+				                                location_str=location_str,
+				                                show_enabled=show_enabled,
+				                                enabled_strs=enabled_str),
+				    sorted(self.plugins.values(), key=lambda x: str(x).lower()))
 			)))
 
 	def get_plugin(self, identifier, require_enabled=True):
@@ -1187,15 +1211,15 @@ class Plugin(object):
 class RestartNeedingPlugin(Plugin):
 	pass
 
-class PluginNeedsRestart(BaseException):
+class PluginNeedsRestart(Exception):
 	def __init__(self, name):
-		super(BaseException, self).__init__()
+		Exception.__init__(self)
 		self.name = name
 		self.message = "Plugin {name} cannot be enabled or disabled after system startup".format(**locals())
 
-class PluginLifecycleException(BaseException):
+class PluginLifecycleException(Exception):
 	def __init__(self, name, reason, message):
-		super(BaseException, self).__init__()
+		Exception.__init__(self)
 		self.name = name
 		self.reason = reason
 
@@ -1206,7 +1230,7 @@ class PluginLifecycleException(BaseException):
 
 class PluginCantInitialize(PluginLifecycleException):
 	def __init__(self, name, reason):
-		super(PluginLifecycleException, self).__init__(name, reason, "Plugin {name} cannot be initialized: {reason}")
+		PluginLifecycleException.__init__(self, name, reason, "Plugin {name} cannot be initialized: {reason}")
 
 class PluginCantEnable(PluginLifecycleException):
 	def __init__(self, name, reason):
@@ -1214,4 +1238,4 @@ class PluginCantEnable(PluginLifecycleException):
 
 class PluginCantDisable(PluginLifecycleException):
 	def __init__(self, name, reason):
-		super(PluginLifecycleException, self).__init__(name, reason, "Plugin {name} cannot be disabled: {reason}")
+		PluginLifecycleException.__init__(self, name, reason, "Plugin {name} cannot be disabled: {reason}")
