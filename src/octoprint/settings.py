@@ -84,6 +84,12 @@ default_settings = {
 			"temperature": 5,
 			"sdStatus": 1
 		},
+		"maxCommunicationTimeouts": {
+			"idle": 2,
+			"printing": 5,
+			"long": 5
+		},
+		"maxWritePasses": 5,
 		"additionalPorts": [],
 		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32", "M400", "M226"],
 		"checksumRequiringCommands": ["M110"],
@@ -162,6 +168,7 @@ default_settings = {
 		"sendChecksumWithUnknownCommands": False,
 		"unknownCommandsNeedAck": False,
 		"sdSupport": True,
+		"sdRelativePath": False,
 		"sdAlwaysAvailable": False,
 		"swallowOkAfterResend": True,
 		"repetierTargetTemp": False,
@@ -275,6 +282,15 @@ default_settings = {
 			}
 		}
 	},
+	"estimation": {
+		"printTime": {
+			"statsWeighingUntil": 0.5,
+			"validityRange": 0.15,
+			"forceDumbFromPercent": 0.3,
+			"forceDumbAfterMin": 30,
+			"stableThreshold": 60
+		}
+	},
 	"devel": {
 		"stylesheet": "css",
 		"cache": {
@@ -293,6 +309,7 @@ default_settings = {
 			"okWithLinenumber": False,
 			"numExtruders": 1,
 			"includeCurrentToolInTemps": True,
+			"includeFilenameInOpened": True,
 			"movementSpeed": {
 				"x": 6000,
 				"y": 6000,
