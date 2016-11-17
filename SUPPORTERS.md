@@ -1,4 +1,4 @@
-# Supporters 
+# Supporters
 
 Development of this version of OctoPrint wouldn't have been possible without
 [financial support by the community](http://octoprint.org/support-octoprint/) -
@@ -7,16 +7,18 @@ thanks to everyone who contributed!
 ## Patreon Patrons
 
   * 3D Moniak
-  * alephobjects
+  * Aleph Objects, Inc.
   * Andrew Moorby
   * Arnljot Arntsen
-  * Aurelio Bernal Ramírez
+  * Aurelio Bernal
   * Bart Zudell
+  * Boris Hussein
   * Brad Jackson
   * Brad Mooneyham
   * Brent Fiegle
   * Brian E. Tyler
   * Charles Mitchell
+  * Christopher Day
   * Christian Petropolis
   * COLLE+McVOY
   * CreativeTools
@@ -28,44 +30,48 @@ thanks to everyone who contributed!
   * Ernesto Martinez
   * Exovite
   * Frank Sander
-  * georgeroblesjr
-  * Gregor Luetolf
+  * Gary Deen
+  * Gary N McKinney
+  * George Robles
+  * Gregor Lütolf
   * J. Eckert
   * Jason Galarneau
   * Joe Korzeniewski
-  * Joshua Gregory
+  * Josh Daniels
+  * Joshua David Gregory
   * Kaile Riser
   * Kale Stedman
   * Kazuhiro Ogura
   * Korneel Bullens
-  * Kyle Gress
+  * Lamin Kivelä
+  * M Khorakiwala
   * Makespace Madrid
   * Mark Lane
   * Mark Qvist
   * Mark Walker
   * Masayoshi Mitsui
-  * Michael McDargh
-  * Miguel Angel Salmeron
-  * Mikey
+  * Michael Aumock
+  * Michael McDargh Sr
   * Miles Flavel
-  * Mohammed Khorakiwala
+  * Nikolai Langer
   * Noe Ruiz
-  * Paul Generes
+  * Patrick McGinnis
   * Peter Grace
   * Peter Schmehl
   * PRINT3Dforum.com
+  * Robert Gusek
   * Roger Strolz
   * Roy Cortes
   * Samer Najia
   * SD3D
+  * SeeMeCNC
   * Shane Ekerbicer
   * Simon Hallam
   * Stefan Krister
-  * stefi davis
   * Steven Pearson
   * Sven Mueller
+  * Terrance Shaw
   * Thomas Hatley
-  * Thomas Sanladerer
   * Trent Shumay
 
-and 844 more wonderful people pledging on the [Patreon campaign](https://patreon.com/foosel)!
+and 968 more wonderful people pledging on the [Patreon campaign](https://patreon.com/foosel)!
